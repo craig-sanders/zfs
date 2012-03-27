@@ -2200,7 +2200,7 @@ get_namewidth(zpool_handle_t *zhp, void *data)
 	if (cb->cb_namewidth < 10)
 		cb->cb_namewidth = 10;
 	if (cb->cb_namewidth > tty_columns - 42)
-		cb->cb_namewidth = tty_columns -42;
+		cb->cb_namewidth = tty_columns - 42;
 
 	return (0);
 }
@@ -4725,11 +4725,10 @@ main(int argc, char **argv)
 
 	env_columns = getenv("COLUMNS");
 
-	if (env_columns != NULL) {
+	if (!isatty(fileno(stdout)))
+		tty_columns = 999;
+	} else if (env_columns != NULL) {
 		tty_columns = atoi(env_columns);
-	} else {
-	  if (!isatty(fileno(stdout)))
-	  	tty_columns = 999;
 	}
 
 	/*
