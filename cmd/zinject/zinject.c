@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
  */
 
 /*
@@ -221,7 +222,7 @@ usage(void)
 	    "\tzinject -c <id|all>\n"
 	    "\n"
 	    "\t\tClear the particular record (if given a numeric ID), or\n"
-	    "\t\tall records if 'all' is specificed.\n"
+	    "\t\tall records if 'all' is specified.\n"
 	    "\n"
 	    "\tzinject -p <function name> pool\n"
 	    "\t\tInject a panic fault at the specified function. Only \n"
@@ -235,8 +236,40 @@ usage(void)
 	    "\t\t'pad1', or 'pad2'.\n"
 	    "\t\t'errno' can be 'nxio' (the default), 'io', or 'dtl'.\n"
 	    "\n"
-	    "\tzinject -d device -A <degrade|fault> pool\n"
-	    "\t\tPerform a specific action on a particular device\n"
+	    "\tzinject -d device -A <degrade|fault> -D <delay secs> pool\n"
+	    "\t\tPerform a specific action on a particular device.\n"
+	    "\n"
+	    "\tzinject -d device -D latency:lanes pool\n"
+	    "\n"
+	    "\t\tAdd an artificial delay to IO requests on a particular\n"
+	    "\t\tdevice, such that the requests take a minimum of 'latency'\n"
+	    "\t\tmilliseconds to complete. Each delay has an associated\n"
+	    "\t\tnumber of 'lanes' which defines the number of concurrent\n"
+	    "\t\tIO requests that can be processed.\n"
+	    "\n"
+	    "\t\tFor example, with a single lane delay of 10 ms (-D 10:1),\n"
+	    "\t\tthe device will only be able to service a single IO request\n"
+	    "\t\tat a time with each request taking 10 ms to complete. So,\n"
+	    "\t\tif only a single request is submitted every 10 ms, the\n"
+	    "\t\taverage latency will be 10 ms; but if more than one request\n"
+	    "\t\tis submitted every 10 ms, the average latency will be more\n"
+	    "\t\tthan 10 ms.\n"
+	    "\n"
+	    "\t\tSimilarly, if a delay of 10 ms is specified to have two\n"
+	    "\t\tlanes (-D 10:2), then the device will be able to service\n"
+	    "\t\ttwo requests at a time, each with a minimum latency of\n"
+	    "\t\t10 ms. So, if two requests are submitted every 10 ms, then\n"
+	    "\t\tthe average latency will be 10 ms; but if more than two\n"
+	    "\t\trequests are submitted every 10 ms, the average latency\n"
+	    "\t\twill be more than 10 ms.\n"
+	    "\n"
+	    "\t\tAlso note, these delays are additive. So two invocations\n"
+	    "\t\tof '-D 10:1', is roughly equivalent to a single invocation\n"
+	    "\t\tof '-D 10:2'. This also means, one can specify multiple\n"
+	    "\t\tlanes with differing target latencies. For example, an\n"
+	    "\t\tinvocation of '-D 10:1' followed by '-D 25:2' will\n"
+	    "\t\tcreate 3 lanes on the device; one lane with a latency\n"
+	    "\t\tof 10 ms and two lanes with a 25 ms latency.\n"
 	    "\n"
 	    "\tzinject -I [-s <seconds> | -g <txgs>] pool\n"
 	    "\t\tCause the pool to stop writing blocks yet not\n"
@@ -256,7 +289,7 @@ usage(void)
 	    "\n"
 	    "\t\tInject an error into the object specified by the '-t' option\n"
 	    "\t\tand the object descriptor.  The 'object' parameter is\n"
-	    "\t\tinterperted depending on the '-t' option.\n"
+	    "\t\tinterpreted depending on the '-t' option.\n"
 	    "\n"
 	    "\t\t-q\tQuiet mode.  Only print out the handler number added.\n"
 	    "\t\t-e\tInject a specific error.  Must be either 'io' or\n"
@@ -294,10 +327,8 @@ static int
 iter_handlers(int (*func)(int, const char *, zinject_record_t *, void *),
     void *data)
 {
-	zfs_cmd_t zc;
+	zfs_cmd_t zc = {"\0"};
 	int ret;
-
-	zc.zc_guid = 0;
 
 	while (ioctl(zfs_fd, ZFS_IOC_INJECT_LIST_NEXT, &zc) == 0)
 		if ((ret = func((int)zc.zc_guid, zc.zc_name,
@@ -354,6 +385,9 @@ print_device_handler(int id, const char *pool, zinject_record_t *record,
 	if (record->zi_guid == 0 || record->zi_func[0] != '\0')
 		return (0);
 
+	if (record->zi_cmd == ZINJECT_DELAY_IO)
+		return (0);
+
 	if (*count == 0) {
 		(void) printf("%3s  %-15s  %s\n", "ID", "POOL", "GUID");
 		(void) printf("---  ---------------  ----------------\n");
@@ -362,6 +396,35 @@ print_device_handler(int id, const char *pool, zinject_record_t *record,
 	*count += 1;
 
 	(void) printf("%3d  %-15s  %llx\n", id, pool,
+	    (u_longlong_t)record->zi_guid);
+
+	return (0);
+}
+
+static int
+print_delay_handler(int id, const char *pool, zinject_record_t *record,
+    void *data)
+{
+	int *count = data;
+
+	if (record->zi_guid == 0 || record->zi_func[0] != '\0')
+		return (0);
+
+	if (record->zi_cmd != ZINJECT_DELAY_IO)
+		return (0);
+
+	if (*count == 0) {
+		(void) printf("%3s  %-15s  %-15s  %-15s  %s\n",
+		    "ID", "POOL", "DELAY (ms)", "LANES", "GUID");
+		(void) printf("---  ---------------  ---------------  "
+		    "---------------  ----------------\n");
+	}
+
+	*count += 1;
+
+	(void) printf("%3d  %-15s  %-15llu  %-15llu  %llx\n", id, pool,
+	    (u_longlong_t)NSEC2MSEC(record->zi_timer),
+	    (u_longlong_t)record->zi_nlanes,
 	    (u_longlong_t)record->zi_guid);
 
 	return (0);
@@ -404,6 +467,13 @@ print_all_handlers(void)
 		count = 0;
 	}
 
+	(void) iter_handlers(print_delay_handler, &count);
+	if (count > 0) {
+		total += count;
+		(void) printf("\n");
+		count = 0;
+	}
+
 	(void) iter_handlers(print_data_handler, &count);
 	if (count > 0) {
 		total += count;
@@ -421,7 +491,7 @@ static int
 cancel_one_handler(int id, const char *pool, zinject_record_t *record,
     void *data)
 {
-	zfs_cmd_t zc;
+	zfs_cmd_t zc = {"\0"};
 
 	zc.zc_guid = (uint64_t)id;
 
@@ -454,7 +524,7 @@ cancel_all_handlers(void)
 static int
 cancel_handler(int id)
 {
-	zfs_cmd_t zc;
+	zfs_cmd_t zc = {"\0"};
 
 	zc.zc_guid = (uint64_t)id;
 
@@ -476,7 +546,7 @@ static int
 register_handler(const char *pool, int flags, zinject_record_t *record,
     int quiet)
 {
-	zfs_cmd_t zc;
+	zfs_cmd_t zc = {"\0"};
 
 	(void) strcpy(zc.zc_name, pool);
 	zc.zc_inject_record = *record;
@@ -533,7 +603,7 @@ register_handler(const char *pool, int flags, zinject_record_t *record,
 int
 perform_action(const char *pool, zinject_record_t *record, int cmd)
 {
-	zfs_cmd_t zc;
+	zfs_cmd_t zc = {"\0"};
 
 	ASSERT(cmd == VDEV_STATE_DEGRADED || cmd == VDEV_STATE_FAULTED);
 	(void) strlcpy(zc.zc_name, pool, sizeof (zc.zc_name));
@@ -544,6 +614,35 @@ perform_action(const char *pool, zinject_record_t *record, int cmd)
 		return (0);
 
 	return (1);
+}
+
+static int
+parse_delay(char *str, uint64_t *delay, uint64_t *nlanes)
+{
+	unsigned long scan_delay;
+	unsigned long scan_nlanes;
+
+	if (sscanf(str, "%lu:%lu", &scan_delay, &scan_nlanes) != 2)
+		return (1);
+
+	/*
+	 * We explicitly disallow a delay of zero here, because we key
+	 * off this value being non-zero in translate_device(), to
+	 * determine if the fault is a ZINJECT_DELAY_IO fault or not.
+	 */
+	if (scan_delay == 0)
+		return (1);
+
+	/*
+	 * The units for the CLI delay parameter is milliseconds, but
+	 * the data passed to the kernel is interpreted as nanoseconds.
+	 * Thus we scale the milliseconds to nanoseconds here, and this
+	 * nanosecond value is used to pass the delay to the kernel.
+	 */
+	*delay = MSEC2NSEC(scan_delay);
+	*nlanes = scan_nlanes;
+
+	return (0);
 }
 
 int
@@ -573,6 +672,18 @@ main(int argc, char **argv)
 	int ret;
 	int flags = 0;
 
+	if ((g_zfs = libzfs_init()) == NULL) {
+		(void) fprintf(stderr, "%s", libzfs_error_init(errno));
+		return (1);
+	}
+
+	libzfs_print_on_error(g_zfs, B_TRUE);
+
+	if ((zfs_fd = open(ZFS_DEV, O_RDWR)) < 0) {
+		(void) fprintf(stderr, "failed to open ZFS device\n");
+		return (1);
+	}
+
 	if (argc == 1) {
 		/*
 		 * No arguments.  Print the available handlers.  If there are no
@@ -589,7 +700,7 @@ main(int argc, char **argv)
 	}
 
 	while ((c = getopt(argc, argv,
-	    ":aA:b:d:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:")) != -1) {
+	    ":aA:b:d:D:f:Fg:qhIc:t:T:l:mr:s:e:uL:p:")) != -1) {
 		switch (c) {
 		case 'a':
 			flags |= ZINJECT_FLUSH_ARC;
@@ -614,6 +725,18 @@ main(int argc, char **argv)
 			break;
 		case 'd':
 			device = optarg;
+			break;
+		case 'D':
+			errno = 0;
+			ret = parse_delay(optarg, &record.zi_timer,
+			    &record.zi_nlanes);
+			if (ret != 0) {
+
+				(void) fprintf(stderr, "invalid i/o delay "
+				    "value: '%s'\n", optarg);
+				usage();
+				return (1);
+			}
 			break;
 		case 'e':
 			if (strcasecmp(optarg, "io") == 0) {
@@ -679,6 +802,7 @@ main(int argc, char **argv)
 		case 'p':
 			(void) strlcpy(record.zi_func, optarg,
 			    sizeof (record.zi_func));
+			record.zi_cmd = ZINJECT_PANIC;
 			break;
 		case 'q':
 			quiet = 1;
@@ -752,23 +876,15 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if ((g_zfs = libzfs_init()) == NULL)
-		return (1);
-
-	libzfs_print_on_error(g_zfs, B_TRUE);
-
-	if ((zfs_fd = open(ZFS_DEV, O_RDWR)) < 0) {
-		(void) fprintf(stderr, "failed to open ZFS device\n");
-		return (1);
-	}
+	if (record.zi_duration != 0)
+		record.zi_cmd = ZINJECT_IGNORED_WRITES;
 
 	if (cancel != NULL) {
 		/*
 		 * '-c' is invalid with any other options.
 		 */
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
-		    level != 0 || record.zi_func[0] != '\0' ||
-		    record.zi_duration != 0) {
+		    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED) {
 			(void) fprintf(stderr, "cancel (-c) incompatible with "
 			    "any other options\n");
 			usage();
@@ -800,8 +916,7 @@ main(int argc, char **argv)
 		 * for doing injection, so handle it separately here.
 		 */
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
-		    level != 0 || record.zi_func[0] != '\0' ||
-		    record.zi_duration != 0) {
+		    level != 0 || record.zi_cmd != ZINJECT_UNINITIALIZED) {
 			(void) fprintf(stderr, "device (-d) incompatible with "
 			    "data error injection\n");
 			usage();
@@ -835,7 +950,7 @@ main(int argc, char **argv)
 
 	} else if (raw != NULL) {
 		if (range != NULL || type != TYPE_INVAL || level != 0 ||
-		    record.zi_func[0] != '\0' || record.zi_duration != 0) {
+		    record.zi_cmd != ZINJECT_UNINITIALIZED) {
 			(void) fprintf(stderr, "raw (-b) format with "
 			    "any other options\n");
 			usage();
@@ -858,13 +973,14 @@ main(int argc, char **argv)
 			return (1);
 		}
 
+		record.zi_cmd = ZINJECT_DATA_FAULT;
 		if (translate_raw(raw, &record) != 0)
 			return (1);
 		if (!error)
 			error = EIO;
-	} else if (record.zi_func[0] != '\0') {
+	} else if (record.zi_cmd == ZINJECT_PANIC) {
 		if (raw != NULL || range != NULL || type != TYPE_INVAL ||
-		    level != 0 || device != NULL || record.zi_duration != 0) {
+		    level != 0 || device != NULL) {
 			(void) fprintf(stderr, "panic (-p) incompatible with "
 			    "other options\n");
 			usage();
@@ -882,7 +998,7 @@ main(int argc, char **argv)
 		if (argv[1] != NULL)
 			record.zi_type = atoi(argv[1]);
 		dataset[0] = '\0';
-	} else if (record.zi_duration != 0) {
+	} else if (record.zi_cmd == ZINJECT_IGNORED_WRITES) {
 		if (nowrites == 0) {
 			(void) fprintf(stderr, "-s or -g meaningless "
 			    "without -I (ignore writes)\n");
@@ -936,6 +1052,7 @@ main(int argc, char **argv)
 			return (1);
 		}
 
+		record.zi_cmd = ZINJECT_DATA_FAULT;
 		if (translate_record(type, argv[0], range, level, &record, pool,
 		    dataset) != 0)
 			return (1);

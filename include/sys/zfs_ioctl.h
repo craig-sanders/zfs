@@ -20,6 +20,8 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright 2016 RackTop Systems.
  */
 
 #ifndef	_SYS_ZFS_IOCTL_H
@@ -41,10 +43,30 @@ extern "C" {
 #endif
 
 /*
+ * The structures in this file are passed between userland and the
+ * kernel.  Userland may be running a 32-bit process, while the kernel
+ * is 64-bit.  Therefore, these structures need to compile the same in
+ * 32-bit and 64-bit.  This means not using type "long", and adding
+ * explicit padding so that the 32-bit structure will not be packed more
+ * tightly than the 64-bit structure (which requires 64-bit alignment).
+ */
+
+/*
  * Property values for snapdir
  */
 #define	ZFS_SNAPDIR_HIDDEN		0
 #define	ZFS_SNAPDIR_VISIBLE		1
+
+/*
+ * Property values for snapdev
+ */
+#define	ZFS_SNAPDEV_HIDDEN		0
+#define	ZFS_SNAPDEV_VISIBLE		1
+/*
+ * Property values for acltype
+ */
+#define	ZFS_ACLTYPE_OFF			0
+#define	ZFS_ACLTYPE_POSIXACL		1
 
 /*
  * Field manipulation macros for the drr_versioninfo field of the
@@ -69,18 +91,32 @@ typedef enum drr_headertype {
  * Feature flags for zfs send streams (flags in drr_versioninfo)
  */
 
-#define	DMU_BACKUP_FEATURE_DEDUP	(0x1)
-#define	DMU_BACKUP_FEATURE_DEDUPPROPS	(0x2)
-#define	DMU_BACKUP_FEATURE_SA_SPILL	(0x4)
+#define	DMU_BACKUP_FEATURE_DEDUP		(1 << 0)
+#define	DMU_BACKUP_FEATURE_DEDUPPROPS		(1 << 1)
+#define	DMU_BACKUP_FEATURE_SA_SPILL		(1 << 2)
+/* flags #3 - #15 are reserved for incompatible closed-source implementations */
+#define	DMU_BACKUP_FEATURE_EMBED_DATA		(1 << 16)
+#define	DMU_BACKUP_FEATURE_EMBED_DATA_LZ4	(1 << 17)
+/* flag #18 is reserved for a Delphix feature */
+#define	DMU_BACKUP_FEATURE_LARGE_BLOCKS		(1 << 19)
+#define	DMU_BACKUP_FEATURE_RESUMING		(1 << 20)
+#define	DMU_BACKUP_FEATURE_LARGE_DNODE		(1 << 21)
 
 /*
  * Mask of all supported backup features
  */
 #define	DMU_BACKUP_FEATURE_MASK	(DMU_BACKUP_FEATURE_DEDUP | \
-		DMU_BACKUP_FEATURE_DEDUPPROPS | DMU_BACKUP_FEATURE_SA_SPILL)
+    DMU_BACKUP_FEATURE_DEDUPPROPS | DMU_BACKUP_FEATURE_SA_SPILL | \
+    DMU_BACKUP_FEATURE_EMBED_DATA | DMU_BACKUP_FEATURE_EMBED_DATA_LZ4 | \
+    DMU_BACKUP_FEATURE_RESUMING | DMU_BACKUP_FEATURE_LARGE_BLOCKS | \
+    DMU_BACKUP_FEATURE_LARGE_DNODE)
 
 /* Are all features in the given flag word currently supported? */
 #define	DMU_STREAM_SUPPORTED(x)	(!((x) & ~DMU_BACKUP_FEATURE_MASK))
+
+typedef enum dmu_send_resume_token_version {
+	ZFS_SEND_RESUME_TOKEN_VERSION = 1
+} dmu_send_resume_token_version_t;
 
 /*
  * The drr_versioninfo field of the dmu_replay_record has the
@@ -101,8 +137,22 @@ typedef enum drr_headertype {
 
 #define	DMU_BACKUP_MAGIC 0x2F5bacbacULL
 
+/*
+ * Send stream flags.  Bits 24-31 are reserved for vendor-specific
+ * implementations and should not be used.
+ */
 #define	DRR_FLAG_CLONE		(1<<0)
 #define	DRR_FLAG_CI_DATA	(1<<1)
+/*
+ * This send stream, if it is a full send, includes the FREE and FREEOBJECT
+ * records that are created by the sending process.  This means that the send
+ * stream can be received as a clone, even though it is not an incremental.
+ * This is not implemented as a feature flag, because the receiving side does
+ * not need to have implemented it to receive this stream; it is fully backwards
+ * compatible.  We need a flag, though, because full send streams without it
+ * cannot necessarily be received as a clone correctly.
+ */
+#define	DRR_FLAG_FREERECORDS	(1<<2)
 
 /*
  * flags in the drr_checksumflags field in the DRR_WRITE and
@@ -119,7 +169,7 @@ typedef struct dmu_replay_record {
 	enum {
 		DRR_BEGIN, DRR_OBJECT, DRR_FREEOBJECTS,
 		DRR_WRITE, DRR_FREE, DRR_END, DRR_WRITE_BYREF,
-		DRR_SPILL, DRR_NUMTYPES
+		DRR_SPILL, DRR_WRITE_EMBEDDED, DRR_NUMTYPES
 	} drr_type;
 	uint32_t drr_payloadlen;
 	union {
@@ -145,7 +195,8 @@ typedef struct dmu_replay_record {
 			uint32_t drr_bonuslen;
 			uint8_t drr_checksumtype;
 			uint8_t drr_compress;
-			uint8_t drr_pad[6];
+			uint8_t drr_dn_slots;
+			uint8_t drr_pad[5];
 			uint64_t drr_toguid;
 			/* bonus content follows */
 		} drr_object;
@@ -196,6 +247,35 @@ typedef struct dmu_replay_record {
 			uint64_t drr_pad[4]; /* needed for crypto */
 			/* spill data follows */
 		} drr_spill;
+		struct drr_write_embedded {
+			uint64_t drr_object;
+			uint64_t drr_offset;
+			/* logical length, should equal blocksize */
+			uint64_t drr_length;
+			uint64_t drr_toguid;
+			uint8_t drr_compression;
+			uint8_t drr_etype;
+			uint8_t drr_pad[6];
+			uint32_t drr_lsize; /* uncompressed size of payload */
+			uint32_t drr_psize; /* compr. (real) size of payload */
+			/* (possibly compressed) content follows */
+		} drr_write_embedded;
+
+		/*
+		 * Nore: drr_checksum is overlaid with all record types
+		 * except DRR_BEGIN.  Therefore its (non-pad) members
+		 * must not overlap with members from the other structs.
+		 * We accomplish this by putting its members at the very
+		 * end of the struct.
+		 */
+		struct drr_checksum {
+			uint64_t drr_pad[34];
+			/*
+			 * fletcher-4 checksum of everything preceding the
+			 * checksum.
+			 */
+			zio_cksum_t drr_checksum;
+		} drr_checksum;
 	} drr_u;
 } dmu_replay_record_t;
 
@@ -230,14 +310,31 @@ typedef struct zinject_record {
 	uint32_t	zi_iotype;
 	int32_t		zi_duration;
 	uint64_t	zi_timer;
+	uint64_t	zi_nlanes;
+	uint32_t	zi_cmd;
+	uint32_t	zi_pad;
 } zinject_record_t;
 
 #define	ZINJECT_NULL		0x1
 #define	ZINJECT_FLUSH_ARC	0x2
 #define	ZINJECT_UNLOAD_SPA	0x4
 
+#define	ZEVENT_NONE		0x0
 #define	ZEVENT_NONBLOCK		0x1
 #define	ZEVENT_SIZE		1024
+
+#define	ZEVENT_SEEK_START	0
+#define	ZEVENT_SEEK_END		UINT64_MAX
+
+typedef enum zinject_type {
+	ZINJECT_UNINITIALIZED,
+	ZINJECT_DATA_FAULT,
+	ZINJECT_DEVICE_FAULT,
+	ZINJECT_LABEL_FAULT,
+	ZINJECT_IGNORED_WRITES,
+	ZINJECT_PANIC,
+	ZINJECT_DELAY_IO,
+} zinject_type_t;
 
 typedef struct zfs_share {
 	uint64_t	z_exportdata;
@@ -258,23 +355,35 @@ typedef enum zfs_case {
 	ZFS_CASE_MIXED
 } zfs_case_t;
 
+/*
+ * Note: this struct must have the same layout in 32-bit and 64-bit, so
+ * that 32-bit processes (like /sbin/zfs) can pass it to the 64-bit
+ * kernel.  Therefore, we add padding to it so that no "hidden" padding
+ * is automatically added on 64-bit (but not on 32-bit).
+ */
 typedef struct zfs_cmd {
-	char		zc_name[MAXPATHLEN];
-	char		zc_value[MAXPATHLEN * 2];
-	char		zc_string[MAXNAMELEN];
-	char		zc_top_ds[MAXPATHLEN];
-	uint64_t	zc_guid;
-	uint64_t	zc_nvlist_conf;		/* really (char *) */
-	uint64_t	zc_nvlist_conf_size;
+	char		zc_name[MAXPATHLEN];	/* name of pool or dataset */
 	uint64_t	zc_nvlist_src;		/* really (char *) */
 	uint64_t	zc_nvlist_src_size;
 	uint64_t	zc_nvlist_dst;		/* really (char *) */
 	uint64_t	zc_nvlist_dst_size;
+	boolean_t	zc_nvlist_dst_filled;	/* put an nvlist in dst? */
+	int		zc_pad2;
+
+	/*
+	 * The following members are for legacy ioctls which haven't been
+	 * converted to the new method.
+	 */
+	uint64_t	zc_history;		/* really (char *) */
+	char		zc_value[MAXPATHLEN * 2];
+	char		zc_string[MAXNAMELEN];
+	uint64_t	zc_guid;
+	uint64_t	zc_nvlist_conf;		/* really (char *) */
+	uint64_t	zc_nvlist_conf_size;
 	uint64_t	zc_cookie;
 	uint64_t	zc_objset_type;
 	uint64_t	zc_perm_action;
-	uint64_t 	zc_history;		/* really (char *) */
-	uint64_t 	zc_history_len;
+	uint64_t	zc_history_len;
 	uint64_t	zc_history_offset;
 	uint64_t	zc_obj;
 	uint64_t	zc_iflags;		/* internal to zfs(7fs) */
@@ -282,11 +391,12 @@ typedef struct zfs_cmd {
 	dmu_objset_stats_t zc_objset_stats;
 	struct drr_begin zc_begin_record;
 	zinject_record_t zc_inject_record;
-	boolean_t	zc_defer_destroy;
-	boolean_t	zc_temphold;
+	uint32_t	zc_defer_destroy;
+	uint32_t	zc_flags;
 	uint64_t	zc_action_handle;
 	int		zc_cleanup_fd;
-	uint8_t		zc_pad[4];		/* alignment */
+	uint8_t		zc_simple;
+	uint8_t		zc_pad[3];		/* alignment */
 	uint64_t	zc_sendobj;
 	uint64_t	zc_fromobj;
 	uint64_t	zc_createtxg;
@@ -316,7 +426,10 @@ extern int zfs_secpolicy_snapshot_perms(const char *name, cred_t *cr);
 extern int zfs_secpolicy_rename_perms(const char *from,
     const char *to, cred_t *cr);
 extern int zfs_secpolicy_destroy_perms(const char *name, cred_t *cr);
-extern int zfs_unmount_snap(const char *, void *);
+extern int zfs_unmount_snap(const char *);
+extern void zfs_destroy_unmount_origin(const char *);
+
+extern boolean_t dataset_name_hidden(const char *name);
 
 enum zfsdev_state_type {
 	ZST_ONEXIT,
@@ -324,8 +437,15 @@ enum zfsdev_state_type {
 	ZST_ALL,
 };
 
+/*
+ * The zfsdev_state_t structure is managed as a singly-linked list
+ * from which items are never deleted.  This allows for lock-free
+ * reading of the list so long as assignments to the zs_next and
+ * reads from zs_minor are performed atomically.  Empty items are
+ * indicated by storing -1 into zs_minor.
+ */
 typedef struct zfsdev_state {
-        list_node_t             zs_next;        /* next zfsdev_state_t link */
+	struct zfsdev_state	*zs_next;	/* next zfsdev_state_t link */
 	struct file		*zs_file;	/* associated file struct */
 	minor_t			zs_minor;	/* made up minor number */
 	void			*zs_onexit;	/* onexit data */
@@ -333,7 +453,7 @@ typedef struct zfsdev_state {
 } zfsdev_state_t;
 
 extern void *zfsdev_get_state(minor_t minor, enum zfsdev_state_type which);
-extern minor_t zfsdev_getminor(struct file *filp);
+extern int zfsdev_getminor(struct file *filp, minor_t *minorp);
 extern minor_t zfsdev_minor_alloc(void);
 
 #endif	/* _KERNEL */

@@ -262,19 +262,30 @@ nvlist_nvflag(nvlist_t *nvl)
 	return (nvl->nvl_nvflag);
 }
 
+static nv_alloc_t *
+nvlist_nv_alloc(int kmflag)
+{
+#if defined(_KERNEL) && !defined(_BOOT)
+	switch (kmflag) {
+	case KM_SLEEP:
+		return (nv_alloc_sleep);
+	case KM_PUSHPAGE:
+		return (nv_alloc_pushpage);
+	default:
+		return (nv_alloc_nosleep);
+	}
+#else
+	return (nv_alloc_nosleep);
+#endif /* _KERNEL && !_BOOT */
+}
+
 /*
  * nvlist_alloc - Allocate nvlist.
  */
-/*ARGSUSED1*/
 int
 nvlist_alloc(nvlist_t **nvlp, uint_t nvflag, int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
-	return (nvlist_xalloc(nvlp, nvflag,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xalloc(nvlp, nvflag, nv_alloc_nosleep));
-#endif
+	return (nvlist_xalloc(nvlp, nvflag, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -601,16 +612,10 @@ nvlist_contains_nvp(nvlist_t *nvl, nvpair_t *nvp)
 /*
  * Make a copy of nvlist
  */
-/*ARGSUSED1*/
 int
 nvlist_dup(nvlist_t *nvl, nvlist_t **nvlp, int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
-	return (nvlist_xdup(nvl, nvlp,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xdup(nvl, nvlp, nv_alloc_nosleep));
-#endif
+	return (nvlist_xdup(nvl, nvlp, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -1611,7 +1616,7 @@ nvlist_lookup_nvpair_ei_sep(nvlist_t *nvl, const char *name, const char sep,
 {
 	nvpair_t	*nvp;
 	const char	*np;
-	char		*sepp=NULL;
+	char		*sepp = NULL;
 	char		*idxp, *idxep;
 	nvlist_t	**nva;
 	long		idx = 0;
@@ -2339,17 +2344,12 @@ nvlist_size(nvlist_t *nvl, size_t *size, int encoding)
 /*
  * Pack nvlist into contiguous memory
  */
-/*ARGSUSED1*/
 int
 nvlist_pack(nvlist_t *nvl, char **bufp, size_t *buflen, int encoding,
     int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
 	return (nvlist_xpack(nvl, bufp, buflen, encoding,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xpack(nvl, bufp, buflen, encoding, nv_alloc_nosleep));
-#endif
+	    nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -2402,16 +2402,10 @@ nvlist_xpack(nvlist_t *nvl, char **bufp, size_t *buflen, int encoding,
 /*
  * Unpack buf into an nvlist_t
  */
-/*ARGSUSED1*/
 int
 nvlist_unpack(char *buf, size_t buflen, nvlist_t **nvlp, int kmflag)
 {
-#if defined(_KERNEL) && !defined(_BOOT)
-	return (nvlist_xunpack(buf, buflen, nvlp,
-	    (kmflag == KM_SLEEP ? nv_alloc_sleep : nv_alloc_nosleep)));
-#else
-	return (nvlist_xunpack(buf, buflen, nvlp, nv_alloc_nosleep));
-#endif
+	return (nvlist_xunpack(buf, buflen, nvlp, nvlist_nv_alloc(kmflag)));
 }
 
 int
@@ -2586,7 +2580,8 @@ nvpair_native_embedded(nvstream_t *nvs, nvpair_t *nvp)
 		 * structure. The address may not be aligned, so we have
 		 * to use bzero.
 		 */
-		bzero(&packed->nvl_priv, sizeof (packed->nvl_priv));
+		bzero((char *)packed + offsetof(nvlist_t, nvl_priv),
+		    sizeof (uint64_t));
 	}
 
 	return (nvs_embedded(nvs, EMBEDDED_NVL(nvp)));
@@ -2614,7 +2609,8 @@ nvpair_native_embedded_array(nvstream_t *nvs, nvpair_t *nvp)
 			 * packed structure. The address may not be aligned,
 			 * so we have to use bzero.
 			 */
-			bzero(&packed->nvl_priv, sizeof (packed->nvl_priv));
+			bzero((char *)packed + offsetof(nvlist_t, nvl_priv),
+			    sizeof (uint64_t));
 	}
 
 	return (nvs_embedded_nvl_array(nvs, nvp, NULL));
@@ -3297,16 +3293,24 @@ nvs_xdr(nvstream_t *nvs, nvlist_t *nvl, char *buf, size_t *buflen)
 }
 
 #if defined(_KERNEL) && defined(HAVE_SPL)
+static int __init
+nvpair_init(void)
+{
+	return (0);
+}
 
-static int nvpair_init(void) { return 0; }
-static int nvpair_fini(void) { return 0; }
+static void __exit
+nvpair_fini(void)
+{
+}
 
-spl_module_init(nvpair_init);
-spl_module_exit(nvpair_fini);
+module_init(nvpair_init);
+module_exit(nvpair_fini);
 
 MODULE_DESCRIPTION("Generic name/value pair implementation");
 MODULE_AUTHOR(ZFS_META_AUTHOR);
 MODULE_LICENSE(ZFS_META_LICENSE);
+MODULE_VERSION(ZFS_META_VERSION "-" ZFS_META_RELEASE);
 
 EXPORT_SYMBOL(nv_alloc_init);
 EXPORT_SYMBOL(nv_alloc_reset);

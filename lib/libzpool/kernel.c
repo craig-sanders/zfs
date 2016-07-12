@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  */
 
 #include <assert.h>
@@ -29,14 +30,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+#include <libgen.h>
 #include <sys/signal.h>
 #include <sys/spa.h>
 #include <sys/stat.h>
 #include <sys/processor.h>
 #include <sys/zfs_context.h>
+#include <sys/rrwlock.h>
 #include <sys/utsname.h>
 #include <sys/time.h>
 #include <sys/systeminfo.h>
+#include <zfs_fletcher.h>
 
 /*
  * Emulation of kernel services in userland.
@@ -46,10 +50,11 @@ int aok;
 uint64_t physmem;
 vnode_t *rootdir = (vnode_t *)0xabcd1234;
 char hw_serial[HW_HOSTID_LEN];
+struct utsname hw_utsname;
+vmem_t *zio_arena = NULL;
 
-struct utsname utsname = {
-	"userland", "libzpool", "1", "1", "na"
-};
+/* If set, all blocks read will be copied to the specified directory. */
+char *vn_dumpdir = NULL;
 
 /* this only exists to have its address taken */
 struct proc p0;
@@ -65,7 +70,7 @@ pthread_mutex_t kthread_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_key_t kthread_key;
 int kthread_nr = 0;
 
-static void
+void
 thread_init(void)
 {
 	kthread_t *kt;
@@ -73,7 +78,7 @@ thread_init(void)
 	VERIFY3S(pthread_key_create(&kthread_key, NULL), ==, 0);
 
 	/* Create entry for primary kthread */
-	kt = umem_zalloc(sizeof(kthread_t), UMEM_NOFAIL);
+	kt = umem_zalloc(sizeof (kthread_t), UMEM_NOFAIL);
 	kt->t_tid = pthread_self();
 	kt->t_func = NULL;
 
@@ -84,7 +89,7 @@ thread_init(void)
 	kthread_nr = 1;
 }
 
-static void
+void
 thread_fini(void)
 {
 	kthread_t *kt = curthread;
@@ -92,7 +97,7 @@ thread_fini(void)
 	ASSERT(pthread_equal(kt->t_tid, pthread_self()));
 	ASSERT3P(kt->t_func, ==, NULL);
 
-	umem_free(kt, sizeof(kthread_t));
+	umem_free(kt, sizeof (kthread_t));
 
 	/* Wait for all threads to exit via thread_exit() */
 	VERIFY3S(pthread_mutex_lock(&kthread_lock), ==, 0);
@@ -100,8 +105,7 @@ thread_fini(void)
 	kthread_nr--; /* Main thread is exiting */
 
 	while (kthread_nr > 0)
-		VERIFY3S(pthread_cond_wait(&kthread_cond, &kthread_lock), ==,
-		    0);
+		VERIFY0(pthread_cond_wait(&kthread_cond, &kthread_lock));
 
 	ASSERT3S(kthread_nr, ==, 0);
 	VERIFY3S(pthread_mutex_unlock(&kthread_lock), ==, 0);
@@ -116,7 +120,7 @@ zk_thread_current(void)
 
 	ASSERT3P(kt, !=, NULL);
 
-	return kt;
+	return (kt);
 }
 
 void *
@@ -129,6 +133,7 @@ zk_thread_helper(void *arg)
 	VERIFY3S(pthread_mutex_lock(&kthread_lock), ==, 0);
 	kthread_nr++;
 	VERIFY3S(pthread_mutex_unlock(&kthread_lock), ==, 0);
+	(void) setpriority(PRIO_PROCESS, 0, kt->t_pri);
 
 	kt->t_tid = pthread_self();
 	((thread_func_arg_t) kt->t_func)(kt->t_arg);
@@ -136,53 +141,57 @@ zk_thread_helper(void *arg)
 	/* Unreachable, thread must exit with thread_exit() */
 	abort();
 
-	return NULL;
+	return (NULL);
 }
 
 kthread_t *
 zk_thread_create(caddr_t stk, size_t stksize, thread_func_t func, void *arg,
-	      size_t len, proc_t *pp, int state, pri_t pri)
+    size_t len, proc_t *pp, int state, pri_t pri, int detachstate)
 {
 	kthread_t *kt;
 	pthread_attr_t attr;
-	size_t stack;
+	char *stkstr;
 
-	ASSERT3S(state & ~TS_RUN, ==, 0);
+	ASSERT0(state & ~TS_RUN);
 
-	kt = umem_zalloc(sizeof(kthread_t), UMEM_NOFAIL);
+	kt = umem_zalloc(sizeof (kthread_t), UMEM_NOFAIL);
 	kt->t_func = func;
 	kt->t_arg = arg;
+	kt->t_pri = pri;
+
+	VERIFY0(pthread_attr_init(&attr));
+	VERIFY0(pthread_attr_setdetachstate(&attr, detachstate));
 
 	/*
-	 * The Solaris kernel stack size is 24k for x86/x86_64.
-	 * The Linux kernel stack size is 8k for x86/x86_64.
-	 *
-	 * We reduce the default stack size in userspace, to ensure
-	 * we observe stack overruns in user space as well as in
-	 * kernel space.  PTHREAD_STACK_MIN is the minimum stack
-	 * required for a NULL procedure in user space and is added
-	 * in to the stack requirements.
-	 *
-	 * Some buggy NPTL threading implementations include the
-	 * guard area within the stack size allocations.  In
-	 * this case we allocate an extra page to account for the
-	 * guard area since we only have two pages of usable stack
-	 * on Linux.
+	 * We allow the default stack size in user space to be specified by
+	 * setting the ZFS_STACK_SIZE environment variable.  This allows us
+	 * the convenience of observing and debugging stack overruns in
+	 * user space.  Explicitly specified stack sizes will be honored.
+	 * The usage of ZFS_STACK_SIZE is discussed further in the
+	 * ENVIRONMENT VARIABLES sections of the ztest(1) man page.
 	 */
+	if (stksize == 0) {
+		stkstr = getenv("ZFS_STACK_SIZE");
 
-	stack = PTHREAD_STACK_MIN + MAX(stksize, STACK_SIZE) +
-			EXTRA_GUARD_BYTES;
+		if (stkstr == NULL)
+			stksize = TS_STACK_MAX;
+		else
+			stksize = MAX(atoi(stkstr), TS_STACK_MIN);
+	}
 
-	VERIFY3S(pthread_attr_init(&attr), ==, 0);
-	VERIFY3S(pthread_attr_setstacksize(&attr, stack), ==, 0);
-	VERIFY3S(pthread_attr_setguardsize(&attr, PAGESIZE), ==, 0);
+	VERIFY3S(stksize, >, 0);
+	stksize = P2ROUNDUP(MAX(stksize, TS_STACK_MIN), PAGESIZE);
+	/*
+	 * If this ever fails, it may be because the stack size is not a
+	 * multiple of system page size.
+	 */
+	VERIFY0(pthread_attr_setstacksize(&attr, stksize));
+	VERIFY0(pthread_attr_setguardsize(&attr, PAGESIZE));
 
-	VERIFY3S(pthread_create(&kt->t_tid, &attr, &zk_thread_helper, kt),
-	    ==, 0);
+	VERIFY0(pthread_create(&kt->t_tid, &attr, &zk_thread_helper, kt));
+	VERIFY0(pthread_attr_destroy(&attr));
 
-	VERIFY3S(pthread_attr_destroy(&attr), ==, 0);
-
-	return kt;
+	return (kt);
 }
 
 void
@@ -192,13 +201,13 @@ zk_thread_exit(void)
 
 	ASSERT(pthread_equal(kt->t_tid, pthread_self()));
 
-	umem_free(kt, sizeof(kthread_t));
+	umem_free(kt, sizeof (kthread_t));
 
-	pthread_mutex_lock(&kthread_lock);
+	VERIFY0(pthread_mutex_lock(&kthread_lock));
 	kthread_nr--;
-	pthread_mutex_unlock(&kthread_lock);
+	VERIFY0(pthread_mutex_unlock(&kthread_lock));
 
-	pthread_cond_broadcast(&kthread_cond);
+	VERIFY0(pthread_cond_broadcast(&kthread_cond));
 	pthread_exit((void *)TS_MAGIC);
 }
 
@@ -218,8 +227,8 @@ zk_thread_join(kt_did_t tid)
  */
 /*ARGSUSED*/
 kstat_t *
-kstat_create(char *module, int instance, char *name, char *class,
-    uchar_t type, ulong_t ndata, uchar_t ks_flag)
+kstat_create(const char *module, int instance, const char *name,
+    const char *class, uchar_t type, ulong_t ndata, uchar_t ks_flag)
 {
 	return (NULL);
 }
@@ -232,6 +241,43 @@ kstat_install(kstat_t *ksp)
 /*ARGSUSED*/
 void
 kstat_delete(kstat_t *ksp)
+{}
+
+/*ARGSUSED*/
+void
+kstat_waitq_enter(kstat_io_t *kiop)
+{}
+
+/*ARGSUSED*/
+void
+kstat_waitq_exit(kstat_io_t *kiop)
+{}
+
+/*ARGSUSED*/
+void
+kstat_runq_enter(kstat_io_t *kiop)
+{}
+
+/*ARGSUSED*/
+void
+kstat_runq_exit(kstat_io_t *kiop)
+{}
+
+/*ARGSUSED*/
+void
+kstat_waitq_to_runq(kstat_io_t *kiop)
+{}
+
+/*ARGSUSED*/
+void
+kstat_runq_back_to_waitq(kstat_io_t *kiop)
+{}
+
+void
+kstat_set_raw_ops(kstat_t *ksp,
+    int (*headers)(char *buf, size_t size),
+    int (*data)(char *buf, size_t size, void *data),
+    void *(*addr)(kstat_t *ksp, loff_t index))
 {}
 
 /*
@@ -255,7 +301,7 @@ mutex_destroy(kmutex_t *mp)
 {
 	ASSERT3U(mp->m_magic, ==, MTX_MAGIC);
 	ASSERT3P(mp->m_owner, ==, MTX_INIT);
-	VERIFY3S(pthread_mutex_destroy(&(mp)->m_lock), ==, 0);
+	ASSERT0(pthread_mutex_destroy(&(mp)->m_lock));
 	mp->m_owner = MTX_DEST;
 	mp->m_magic = 0;
 }
@@ -274,13 +320,15 @@ mutex_enter(kmutex_t *mp)
 int
 mutex_tryenter(kmutex_t *mp)
 {
+	int err;
 	ASSERT3U(mp->m_magic, ==, MTX_MAGIC);
 	ASSERT3P(mp->m_owner, !=, MTX_DEST);
-	if (0 == pthread_mutex_trylock(&mp->m_lock)) {
+	if (0 == (err = pthread_mutex_trylock(&mp->m_lock))) {
 		ASSERT3P(mp->m_owner, ==, MTX_INIT);
 		mp->m_owner = curthread;
 		return (1);
 	} else {
+		VERIFY3S(err, ==, EBUSY);
 		return (0);
 	}
 }
@@ -329,7 +377,7 @@ void
 rw_destroy(krwlock_t *rwlp)
 {
 	ASSERT3U(rwlp->rw_magic, ==, RW_MAGIC);
-
+	ASSERT(rwlp->rw_readers == 0 && rwlp->rw_wr_owner == RW_INIT);
 	VERIFY3S(pthread_rwlock_destroy(&rwlp->rw_lock), ==, 0);
 	rwlp->rw_magic = 0;
 }
@@ -422,14 +470,14 @@ cv_init(kcondvar_t *cv, char *name, int type, void *arg)
 {
 	ASSERT3S(type, ==, CV_DEFAULT);
 	cv->cv_magic = CV_MAGIC;
-	VERIFY3S(pthread_cond_init(&cv->cv, NULL), ==, 0);
+	VERIFY0(pthread_cond_init(&cv->cv, NULL));
 }
 
 void
 cv_destroy(kcondvar_t *cv)
 {
 	ASSERT3U(cv->cv_magic, ==, CV_MAGIC);
-	VERIFY3S(pthread_cond_destroy(&cv->cv), ==, 0);
+	VERIFY0(pthread_cond_destroy(&cv->cv));
 	cv->cv_magic = 0;
 }
 
@@ -439,9 +487,7 @@ cv_wait(kcondvar_t *cv, kmutex_t *mp)
 	ASSERT3U(cv->cv_magic, ==, CV_MAGIC);
 	ASSERT3P(mutex_owner(mp), ==, curthread);
 	mp->m_owner = MTX_INIT;
-	int ret = pthread_cond_wait(&cv->cv, &mp->m_lock);
-	if (ret != 0)
-		VERIFY3S(ret, ==, EINTR);
+	VERIFY0(pthread_cond_wait(&cv->cv, &mp->m_lock));
 	mp->m_owner = curthread;
 }
 
@@ -455,7 +501,6 @@ cv_timedwait(kcondvar_t *cv, kmutex_t *mp, clock_t abstime)
 
 	ASSERT3U(cv->cv_magic, ==, CV_MAGIC);
 
-top:
 	delta = abstime - ddi_get_lbolt();
 	if (delta <= 0)
 		return (-1);
@@ -477,10 +522,41 @@ top:
 	if (error == ETIMEDOUT)
 		return (-1);
 
-	if (error == EINTR)
-		goto top;
+	VERIFY0(error);
 
-	VERIFY3S(error, ==, 0);
+	return (1);
+}
+
+/*ARGSUSED*/
+clock_t
+cv_timedwait_hires(kcondvar_t *cv, kmutex_t *mp, hrtime_t tim, hrtime_t res,
+    int flag)
+{
+	int error;
+	timestruc_t ts;
+	hrtime_t delta;
+
+	ASSERT(flag == 0 || flag == CALLOUT_FLAG_ABSOLUTE);
+
+	delta = tim;
+	if (flag & CALLOUT_FLAG_ABSOLUTE)
+		delta -= gethrtime();
+
+	if (delta <= 0)
+		return (-1);
+
+	ts.tv_sec = delta / NANOSEC;
+	ts.tv_nsec = delta % NANOSEC;
+
+	ASSERT(mutex_owner(mp) == curthread);
+	mp->m_owner = NULL;
+	error = pthread_cond_timedwait(&cv->cv, &mp->m_lock, &ts);
+	mp->m_owner = curthread;
+
+	if (error == ETIMEDOUT)
+		return (-1);
+
+	VERIFY0(error);
 
 	return (1);
 }
@@ -489,14 +565,14 @@ void
 cv_signal(kcondvar_t *cv)
 {
 	ASSERT3U(cv->cv_magic, ==, CV_MAGIC);
-	VERIFY3S(pthread_cond_signal(&cv->cv), ==, 0);
+	VERIFY0(pthread_cond_signal(&cv->cv));
 }
 
 void
 cv_broadcast(kcondvar_t *cv)
 {
 	ASSERT3U(cv->cv_magic, ==, CV_MAGIC);
-	VERIFY3S(pthread_cond_broadcast(&cv->cv), ==, 0);
+	VERIFY0(pthread_cond_broadcast(&cv->cv));
 }
 
 /*
@@ -516,8 +592,9 @@ int
 vn_open(char *path, int x1, int flags, int mode, vnode_t **vpp, int x2, int x3)
 {
 	int fd;
+	int dump_fd;
 	vnode_t *vp;
-	int old_umask;
+	int old_umask = 0;
 	char *realpath;
 	struct stat64 st;
 	int err;
@@ -583,13 +660,31 @@ vn_open(char *path, int x1, int flags, int mode, vnode_t **vpp, int x2, int x3)
 	 * FREAD and FWRITE to the corresponding O_RDONLY, O_WRONLY, and O_RDWR.
 	 */
 	fd = open64(realpath, flags - FREAD, mode);
-	free(realpath);
+	err = errno;
 
 	if (flags & FCREAT)
 		(void) umask(old_umask);
 
+	if (vn_dumpdir != NULL) {
+		char *dumppath = umem_zalloc(MAXPATHLEN, UMEM_NOFAIL);
+		(void) snprintf(dumppath, MAXPATHLEN,
+		    "%s/%s", vn_dumpdir, basename(realpath));
+		dump_fd = open64(dumppath, O_CREAT | O_WRONLY, 0666);
+		umem_free(dumppath, MAXPATHLEN);
+		if (dump_fd == -1) {
+			err = errno;
+			free(realpath);
+			close(fd);
+			return (err);
+		}
+	} else {
+		dump_fd = -1;
+	}
+
+	free(realpath);
+
 	if (fd == -1)
-		return (errno);
+		return (err);
 
 	if (fstat64_blk(fd, &st) == -1) {
 		err = errno;
@@ -604,6 +699,7 @@ vn_open(char *path, int x1, int flags, int mode, vnode_t **vpp, int x2, int x3)
 	vp->v_fd = fd;
 	vp->v_size = st.st_size;
 	vp->v_path = spa_strdup(path);
+	vp->v_dump_fd = dump_fd;
 
 	return (0);
 }
@@ -636,12 +732,19 @@ vn_rdwr(int uio, vnode_t *vp, void *addr, ssize_t len, offset_t offset,
 
 	if (uio == UIO_READ) {
 		rc = pread64(vp->v_fd, addr, len, offset);
+		if (vp->v_dump_fd != -1) {
+			int status;
+			status = pwrite64(vp->v_dump_fd, addr, rc, offset);
+			ASSERT(status != -1);
+		}
 	} else {
 		/*
 		 * To simulate partial disk writes, we split writes into two
 		 * system calls so that the process can be killed in between.
 		 */
-		split = (len > 0 ? rand() % len : 0);
+		int sectors = len >> SPA_MINBLOCKSHIFT;
+		split = (sectors > 0 ? rand() % sectors : 0) <<
+		    SPA_MINBLOCKSHIFT;
 		rc = pwrite64(vp->v_fd, addr, split, offset);
 		if (rc != -1) {
 			done = rc;
@@ -657,7 +760,7 @@ vn_rdwr(int uio, vnode_t *vp, void *addr, ssize_t len, offset_t offset,
 		 * (memory or disk) due to O_DIRECT, so we abort() in order to
 		 * catch the offender.
 		 */
-		 abort();
+		abort();
 	}
 #endif
 	if (rc == -1)
@@ -676,6 +779,8 @@ void
 vn_close(vnode_t *vp)
 {
 	close(vp->v_fd);
+	if (vp->v_dump_fd != -1)
+		close(vp->v_dump_fd);
 	spa_strfree(vp->v_path);
 	umem_free(vp, sizeof (vnode_t));
 }
@@ -766,6 +871,9 @@ dprintf_setup(int *argc, char **argv)
 	 */
 	if (dprintf_find_string("on"))
 		dprintf_print_all = 1;
+
+	if (dprintf_string != NULL)
+		zfs_flags |= ZFS_DEBUG_DPRINTF;
 }
 
 /*
@@ -889,8 +997,9 @@ kobj_read_file(struct _buf *file, char *buf, unsigned size, unsigned off)
 {
 	ssize_t resid;
 
-	vn_rdwr(UIO_READ, (vnode_t *)file->_fd, buf, size, (offset_t)off,
-	    UIO_SYSSPACE, 0, 0, 0, &resid);
+	if (vn_rdwr(UIO_READ, (vnode_t *)file->_fd, buf, size, (offset_t)off,
+	    UIO_SYSSPACE, 0, 0, 0, &resid) != 0)
+		return (-1);
 
 	return (size - resid);
 }
@@ -934,17 +1043,15 @@ delay(clock_t ticks)
  * High order bit is 31 (or 63 in _LP64 kernel).
  */
 int
-highbit(ulong_t i)
+highbit64(uint64_t i)
 {
 	register int h = 1;
 
 	if (i == 0)
 		return (0);
-#ifdef _LP64
-	if (i & 0xffffffff00000000ul) {
+	if (i & 0xffffffff00000000ULL) {
 		h += 32; i >>= 32;
 	}
-#endif
 	if (i & 0xffff0000) {
 		h += 16; i >>= 16;
 	}
@@ -962,6 +1069,50 @@ highbit(ulong_t i)
 	}
 	return (h);
 }
+
+/*
+ * Find lowest one bit set.
+ * Returns bit number + 1 of lowest bit that is set, otherwise returns 0.
+ * This is basically a reimplementation of ffsll(), which is GNU specific.
+ */
+int
+lowbit64(uint64_t i)
+{
+	register int h = 64;
+	if (i == 0)
+		return (0);
+
+	if (i & 0x00000000ffffffffULL)
+		h -= 32;
+	else
+		i >>= 32;
+
+	if (i & 0x0000ffff)
+		h -= 16;
+	else
+		i >>= 16;
+
+	if (i & 0x00ff)
+		h -= 8;
+	else
+		i >>= 8;
+
+	if (i & 0x0f)
+		h -= 4;
+	else
+		i >>= 4;
+
+	if (i & 0x3)
+		h -= 2;
+	else
+		i >>= 2;
+
+	if (i & 0x1)
+		h -= 1;
+
+	return (h);
+}
+
 
 static int random_fd = -1, urandom_fd = -1;
 
@@ -1017,6 +1168,12 @@ ddi_strtoull(const char *str, char **nptr, int base, u_longlong_t *result)
 	return (0);
 }
 
+utsname_t *
+utsname(void)
+{
+	return (&hw_utsname);
+}
+
 /*
  * =========================================================================
  * kernel emulation setup & teardown
@@ -1032,9 +1189,35 @@ umem_out_of_memory(void)
 	return (0);
 }
 
+static unsigned long
+get_spl_hostid(void)
+{
+	FILE *f;
+	unsigned long hostid;
+
+	f = fopen("/sys/module/spl/parameters/spl_hostid", "r");
+	if (!f)
+		return (0);
+	if (fscanf(f, "%lu", &hostid) != 1)
+		hostid = 0;
+	fclose(f);
+	return (hostid & 0xffffffff);
+}
+
+unsigned long
+get_system_hostid(void)
+{
+	unsigned long system_hostid = get_spl_hostid();
+	if (system_hostid == 0)
+		system_hostid = gethostid() & 0xffffffff;
+	return (system_hostid);
+}
+
 void
 kernel_init(int mode)
 {
+	extern uint_t rrw_tsd_key;
+
 	umem_nofail_callback(umem_out_of_memory);
 
 	physmem = sysconf(_SC_PHYS_PAGES);
@@ -1043,20 +1226,26 @@ kernel_init(int mode)
 	    (double)physmem * sysconf(_SC_PAGE_SIZE) / (1ULL << 30));
 
 	(void) snprintf(hw_serial, sizeof (hw_serial), "%ld",
-	    (mode & FWRITE) ? gethostid() : 0);
+	    (mode & FWRITE) ? get_system_hostid() : 0);
 
 	VERIFY((random_fd = open("/dev/random", O_RDONLY)) != -1);
 	VERIFY((urandom_fd = open("/dev/urandom", O_RDONLY)) != -1);
+	VERIFY0(uname(&hw_utsname));
 
 	thread_init();
 	system_taskq_init();
 
 	spa_init(mode);
+
+	fletcher_4_init();
+
+	tsd_create(&rrw_tsd_key, rrw_tsd_destroy);
 }
 
 void
 kernel_fini(void)
 {
+	fletcher_4_fini();
 	spa_fini();
 
 	system_taskq_fini();
@@ -1071,6 +1260,12 @@ kernel_fini(void)
 
 uid_t
 crgetuid(cred_t *cr)
+{
+	return (0);
+}
+
+uid_t
+crgetruid(cred_t *cr)
 {
 	return (0);
 }
@@ -1107,6 +1302,12 @@ zfs_secpolicy_rename_perms(const char *from, const char *to, cred_t *cr)
 
 int
 zfs_secpolicy_destroy_perms(const char *name, cred_t *cr)
+{
+	return (0);
+}
+
+int
+secpolicy_zfs(const cred_t *cr)
 {
 	return (0);
 }
@@ -1188,4 +1389,44 @@ int
 zfs_onexit_cb_data(minor_t minor, uint64_t action_handle, void **data)
 {
 	return (0);
+}
+
+fstrans_cookie_t
+spl_fstrans_mark(void)
+{
+	return ((fstrans_cookie_t) 0);
+}
+
+void
+spl_fstrans_unmark(fstrans_cookie_t cookie)
+{
+}
+
+int
+spl_fstrans_check(void)
+{
+	return (0);
+}
+
+void *zvol_tag = "zvol_tag";
+
+void
+zvol_create_minors(spa_t *spa, const char *name, boolean_t async)
+{
+}
+
+void
+zvol_remove_minor(spa_t *spa, const char *name, boolean_t async)
+{
+}
+
+void
+zvol_remove_minors(spa_t *spa, const char *name, boolean_t async)
+{
+}
+
+void
+zvol_rename_minors(spa_t *spa, const char *oldname, const char *newname,
+    boolean_t async)
+{
 }

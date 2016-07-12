@@ -63,6 +63,17 @@ fi
 # Initialize the test suite
 init
 
+# Disable the udev rule 90-zfs.rules to prevent the zfs module
+# stack from being loaded due to the detection of a zfs device.
+# This is important because this test scripts require full control
+# over when and how the modules are loaded/unloaded.  A trap is
+# set to ensure the udev rule is correctly replaced on exit.
+RULE=${udevruledir}/90-zfs.rules
+if test -e  ${RULE}; then
+	trap "mv ${RULE}.disabled ${RULE}" INT TERM EXIT
+	mv ${RULE} ${RULE}.disabled
+fi
+
 # Perform pre-cleanup is requested
 if [ ${CLEANUP} ]; then
 	${ZFS_SH} -u
@@ -96,6 +107,7 @@ test_1() {
 	# Unload/load the module stack and verify the pool persists.
 	${ZFS_SH} -u || fail 4
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 5
+	${ZPOOL} import -c ${TMP_CACHE} ${POOL_NAME} || fail 5
 	${ZPOOL} status ${POOL_NAME} >${TMP_FILE2} || fail 6
 	cmp ${TMP_FILE1} ${TMP_FILE2} || fail 7
 
@@ -126,8 +138,7 @@ test_2() {
 	${ZFS_SH} -u || fail 4
 	rm -f ${TMP_CACHE} || fail 5
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 6
-	${ZPOOL} import | grep ${POOL_NAME} >/dev/null || fail 7
-	${ZPOOL} import -f ${POOL_NAME} || fail 8
+	${ZPOOL} import -d /dev ${POOL_NAME} || fail 8
 	${ZPOOL} status ${POOL_NAME} >${TMP_FILE2} || fail 9
 	cmp ${TMP_FILE1} ${TMP_FILE2} || fail 10
 
@@ -192,9 +203,10 @@ test_3() {
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 1
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 || fail 2
 	${ZFS} create -V 100M ${FULL_ZVOL_NAME} || fail 3
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 3
 	label /dev/zvol/${FULL_ZVOL_NAME} msdos || fail 4
 	partition /dev/zvol/${FULL_ZVOL_NAME} primary 1% 50% || fail 4
-	partition /dev/zvol/${FULL_ZVOL_NAME} primary 50% 100% || fail 4
+	partition /dev/zvol/${FULL_ZVOL_NAME} primary 51% -1 || fail 4
 	${ZFS} snapshot ${FULL_SNAP_NAME} || fail 5
 	${ZFS} clone ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 6
 
@@ -216,15 +228,26 @@ test_3() {
 	zconfig_zvol_device_stat 10 ${POOL_NAME} ${FULL_ZVOL_NAME} \
 	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 11
 
+	# Toggle the snapdev and observe snapshot device links toggled
+	${ZFS} set snapdev=hidden ${FULL_ZVOL_NAME} || fail 12
+	
+	zconfig_zvol_device_stat 7 ${POOL_NAME} ${FULL_ZVOL_NAME} \
+	    "invalid" ${FULL_CLONE_NAME} || fail 13
+
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 14
+
+	zconfig_zvol_device_stat 10 ${POOL_NAME} ${FULL_ZVOL_NAME} \
+	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 15
+
 	# Destroy the pool and consequently the devices
-	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 -d || fail 12
+	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 -d || fail 16
 
 	# verify the devices were removed
 	zconfig_zvol_device_stat 0 ${POOL_NAME} ${FULL_ZVOL_NAME} \
-	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 13
+	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 17
 
-	${ZFS_SH} -u || fail 14
-	rm -f ${TMP_CACHE} || fail 15
+	${ZFS_SH} -u || fail 18
+	rm -f ${TMP_CACHE} || fail 19
 
 	pass
 }
@@ -245,9 +268,10 @@ test_4() {
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 1
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 || fail 2
 	${ZFS} create -V 100M ${FULL_ZVOL_NAME} || fail 3
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 3
 	label /dev/zvol/${FULL_ZVOL_NAME} msdos || fail 4
 	partition /dev/zvol/${FULL_ZVOL_NAME} primary 1% 50% || fail 4
-	partition /dev/zvol/${FULL_ZVOL_NAME} primary 50% 100% || fail 4
+	partition /dev/zvol/${FULL_ZVOL_NAME} primary 51% -1 || fail 4
 	${ZFS} snapshot ${FULL_SNAP_NAME} || fail 5
 	${ZFS} clone ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 6
 
@@ -262,8 +286,10 @@ test_4() {
 	zconfig_zvol_device_stat 0 ${POOL_NAME} ${FULL_ZVOL_NAME} \
 	    ${FULL_SNAP_NAME} ${FULL_CLONE_NAME} || fail 9
 
-	# Load the modules, wait 1 second for udev
+	# Load the modules, list the pools to ensure they are opened
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 10
+	${ZPOOL} import -c ${TMP_CACHE} ${POOL_NAME} || fail 10
+	${ZPOOL} list &>/dev/null
 
 	# Verify the devices were created
 	zconfig_zvol_device_stat 10 ${POOL_NAME} ${FULL_ZVOL_NAME} \
@@ -288,7 +314,6 @@ test_5() {
 	local POOL_NAME=tank
 	local ZVOL_NAME=fish
 	local FULL_NAME=${POOL_NAME}/${ZVOL_NAME}
-	local SRC_DIR=/bin/
 	local TMP_CACHE=`mktemp -p /tmp zpool.cache.XXXXXXXX`
 
 	# Create a pool and volume.
@@ -306,11 +331,11 @@ test_5() {
 	sync
 
 	# Verify the copied files match the original files.
-	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1${SRC_DIR} \
+	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1/${SRC_DIR##*/} \
 		&>/dev/null || fail 9
 
 	# Remove the files, umount, destroy the volume and pool.
-	rm -Rf /tmp/${ZVOL_NAME}-part1${SRC_DIR}* || fail 10
+	rm -Rf /tmp/${ZVOL_NAME}-part1/${SRC_DIR##*/} || fail 10
 	umount /tmp/${ZVOL_NAME}-part1 || fail 11
 	rmdir /tmp/${ZVOL_NAME}-part1 || fail 12
 
@@ -330,13 +355,13 @@ test_6() {
 	local SNAP_NAME=pristine
 	local FULL_ZVOL_NAME=${POOL_NAME}/${ZVOL_NAME}
 	local FULL_SNAP_NAME=${POOL_NAME}/${ZVOL_NAME}@${SNAP_NAME}
-	local SRC_DIR=/bin/
 	local TMP_CACHE=`mktemp -p /tmp zpool.cache.XXXXXXXX`
 
 	# Create a pool and volume.
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 1
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raid0 || fail 2
 	${ZFS} create -V 800M ${FULL_ZVOL_NAME} || fail 3
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 3
 	label /dev/zvol/${FULL_ZVOL_NAME} msdos || fail 4
 	partition /dev/zvol/${FULL_ZVOL_NAME} primary 1 -1 || fail 4
 	format /dev/zvol/${FULL_ZVOL_NAME}-part1 ext2 || fail 5
@@ -359,9 +384,9 @@ test_6() {
 
 	# Verify the copied files match the original files,
 	# and the copied files do NOT appear in the snapshot.
-	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1${SRC_DIR} \
+	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1/${SRC_DIR##*/} \
 		&>/dev/null || fail 12
-	diff -ur ${SRC_DIR} /tmp/${SNAP_NAME}-part1${SRC_DIR} \
+	diff -ur ${SRC_DIR} /tmp/${SNAP_NAME}-part1/${SRC_DIR##*/} \
 		&>/dev/null && fail 13
 
 	# umount, destroy the snapshot, volume, and pool.
@@ -390,25 +415,27 @@ test_7() {
 	local FULL_ZVOL_NAME=${POOL_NAME}/${ZVOL_NAME}
 	local FULL_SNAP_NAME=${POOL_NAME}/${ZVOL_NAME}@${SNAP_NAME}
 	local FULL_CLONE_NAME=${POOL_NAME}/${CLONE_NAME}
-	local SRC_DIR=/bin/
 	local TMP_CACHE=`mktemp -p /tmp zpool.cache.XXXXXXXX`
 
 	# Create a pool and volume.
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 1
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 || fail 2
 	${ZFS} create -V 300M ${FULL_ZVOL_NAME} || fail 3
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME} || fail 3
 	label /dev/zvol/${FULL_ZVOL_NAME} msdos || fail 4
 	partition /dev/zvol/${FULL_ZVOL_NAME} primary 1 -1 || fail 4
 	format /dev/zvol/${FULL_ZVOL_NAME}-part1 ext2 || fail 5
 
-	# Mount the ext2 filesystem and copy some data to it.
-	mkdir -p /tmp/${ZVOL_NAME}-part1 || fail 6
-	mount /dev/zvol/${FULL_ZVOL_NAME}-part1 /tmp/${ZVOL_NAME}-part1 \
-		|| fail 7
+	# Snapshot the pristine ext2 filesystem.
+	${ZFS} snapshot ${FULL_SNAP_NAME} || fail 6
+	wait_udev /dev/zvol/${FULL_SNAP_NAME}-part1 30 || fail 7
 
-	# Snapshot the pristine ext2 filesystem and mount it read-only.
-	${ZFS} snapshot ${FULL_SNAP_NAME} || fail 8
-	wait_udev /dev/zvol/${FULL_SNAP_NAME}-part1 30 || fail 8
+	# Mount the ext2 filesystem so some data can be copied to it.
+	mkdir -p /tmp/${ZVOL_NAME}-part1 || fail 7
+	mount /dev/zvol/${FULL_ZVOL_NAME}-part1 \
+		/tmp/${ZVOL_NAME}-part1 || fail 8
+
+	# Mount the pristine ext2 snapshot.
 	mkdir -p /tmp/${SNAP_NAME}-part1 || fail 9
 	mount /dev/zvol/${FULL_SNAP_NAME}-part1 \
 		/tmp/${SNAP_NAME}-part1 &>/dev/null || fail 10
@@ -419,9 +446,9 @@ test_7() {
 
 	# Verify the copied files match the original files,
 	# and the copied files do NOT appear in the snapshot.
-	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1${SRC_DIR} \
+	diff -ur ${SRC_DIR} /tmp/${ZVOL_NAME}-part1/${SRC_DIR##*/} \
 		&>/dev/null || fail 12
-	diff -ur ${SRC_DIR} /tmp/${SNAP_NAME}-part1${SRC_DIR} \
+	diff -ur ${SRC_DIR} /tmp/${SNAP_NAME}-part1/${SRC_DIR##*/} \
 		&>/dev/null && fail 13
 
 	# Clone from the original pristine snapshot
@@ -477,7 +504,6 @@ test_8() {
 	local FULL_ZVOL_NAME2=${POOL_NAME2}/${ZVOL_NAME}
 	local FULL_SNAP_NAME1=${POOL_NAME1}/${ZVOL_NAME}@${SNAP_NAME}
 	local FULL_SNAP_NAME2=${POOL_NAME2}/${ZVOL_NAME}@${SNAP_NAME}
-	local SRC_DIR=/bin/
 	local TMP_CACHE=`mktemp -p /tmp zpool.cache.XXXXXXXX`
 
 	# Create two pools and a volume
@@ -485,6 +511,7 @@ test_8() {
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME1} -c lo-raidz2 || fail 2
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME2} -c lo-raidz2 || fail 2
 	${ZFS} create -V 300M ${FULL_ZVOL_NAME1} || fail 3
+	${ZFS} set snapdev=visible ${FULL_ZVOL_NAME1} || fail 3
 	label /dev/zvol/${FULL_ZVOL_NAME1} msdos || fail 4
 	partition /dev/zvol/${FULL_ZVOL_NAME1} primary 1 -1 || fail 4
 	format /dev/zvol/${FULL_ZVOL_NAME1}-part1 ext2 || fail 5
@@ -494,11 +521,14 @@ test_8() {
 	mount /dev/zvol/${FULL_ZVOL_NAME1}-part1 \
 		/tmp/${FULL_ZVOL_NAME1}-part1 || fail 7
 	cp -RL ${SRC_DIR} /tmp/${FULL_ZVOL_NAME1}-part1 || fail 8
-	sync || fail 9
 
-	# Snapshot the ext2 filesystem so it may be sent.
-	${ZFS} snapshot ${FULL_SNAP_NAME1} || fail 11
-	wait_udev /dev/zvol/${FULL_SNAP_NAME1} 30 || fail 11
+	# Unmount, snapshot, mount the ext2 filesystem so it may be sent.
+	# We only unmount to ensure the ext2 filesystem is clean.
+	umount /tmp/${FULL_ZVOL_NAME1}-part1 || fail 9
+	${ZFS} snapshot ${FULL_SNAP_NAME1} || fail 10
+	wait_udev /dev/zvol/${FULL_SNAP_NAME1} 30 || fail 10
+	mount /dev/zvol/${FULL_ZVOL_NAME1}-part1 \
+		/tmp/${FULL_ZVOL_NAME1}-part1 || 11
 
 	# Send/receive the snapshot from POOL_NAME1 to POOL_NAME2
 	(${ZFS} send ${FULL_SNAP_NAME1} | \
@@ -547,6 +577,7 @@ test_9() {
 	${ZFS_SH} zfs="spa_config_path=${TMP_CACHE}" || fail 1
 	${ZPOOL_CREATE_SH} -p ${POOL_NAME} -c lo-raidz2 || fail 2
 	${ZFS} create -V 300M ${FULL_NAME} || fail 3
+	udev_trigger
 
 	# Dump the events, there should be at least 5 lines.
 	${ZPOOL} events >${TMP_EVENTS} || fail 4

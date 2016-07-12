@@ -27,7 +27,7 @@
  */
 
 #ifndef _ZFS_BLKDEV_H
-#define _ZFS_BLKDEV_H
+#define	_ZFS_BLKDEV_H
 
 #include <linux/blkdev.h>
 #include <linux/elevator.h>
@@ -35,102 +35,6 @@
 #ifndef HAVE_FMODE_T
 typedef unsigned __bitwise__ fmode_t;
 #endif /* HAVE_FMODE_T */
-
-#ifndef HAVE_BLK_FETCH_REQUEST
-static inline struct request *
-blk_fetch_request(struct request_queue *q)
-{
-	struct request *req;
-
-	req = elv_next_request(q);
-	if (req)
-		blkdev_dequeue_request(req);
-
-	return req;
-}
-#endif /* HAVE_BLK_FETCH_REQUEST */
-
-#ifndef HAVE_BLK_REQUEUE_REQUEST
-static inline void
-blk_requeue_request(request_queue_t *q, struct request *req)
-{
-	elv_requeue_request(q, req);
-}
-#endif /* HAVE_BLK_REQUEUE_REQUEST */
-
-#ifndef HAVE_BLK_END_REQUEST
-static inline bool
-__blk_end_request(struct request *req, int error, unsigned int nr_bytes)
-{
-	LIST_HEAD(list);
-
-	/*
-	 * Request has already been dequeued but 2.6.18 version of
-	 * end_request() unconditionally dequeues the request so we
-	 * add it to a local list to prevent hitting the BUG_ON.
-	 */
-	list_add(&req->queuelist, &list);
-
-	/*
-	 * The old API required the driver to end each segment and not
-	 * the entire request.  In our case we always need to end the
-	 * entire request partial requests are not supported.
-	 */
-	req->hard_cur_sectors = nr_bytes >> 9;
-	end_request(req, ((error == 0) ? 1 : error));
-
-	return 0;
-}
-
-static inline bool
-blk_end_request(struct request *req, int error, unsigned int nr_bytes)
-{
-	struct request_queue *q = req->q;
-	bool rc;
-
-	spin_lock_irq(q->queue_lock);
-	rc = __blk_end_request(req, error, nr_bytes);
-	spin_unlock_irq(q->queue_lock);
-
-	return rc;
-}
-#else
-# ifdef HAVE_BLK_END_REQUEST_GPL_ONLY
-/*
- * Define required to avoid conflicting 2.6.29 non-static prototype for a
- * GPL-only version of the helper.  As of 2.6.31 the helper is available
- * to non-GPL modules and is not explicitly exported GPL-only.
- */
-# define __blk_end_request __blk_end_request_x
-# define blk_end_request blk_end_request_x
-
-static inline bool
-__blk_end_request_x(struct request *req, int error, unsigned int nr_bytes)
-{
-	/*
-	 * The old API required the driver to end each segment and not
-	 * the entire request.  In our case we always need to end the
-	 * entire request partial requests are not supported.
-	 */
-	req->hard_cur_sectors = nr_bytes >> 9;
-	end_request(req, ((error == 0) ? 1 : error));
-
-	return 0;
-}
-static inline bool
-blk_end_request_x(struct request *req, int error, unsigned int nr_bytes)
-{
-	struct request_queue *q = req->q;
-	bool rc;
-
-	spin_lock_irq(q->queue_lock);
-	rc = __blk_end_request_x(req, error, nr_bytes);
-	spin_unlock_irq(q->queue_lock);
-
-	return rc;
-}
-# endif /* HAVE_BLK_END_REQUEST_GPL_ONLY */
-#endif /* HAVE_BLK_END_REQUEST */
 
 /*
  * 2.6.36 API change,
@@ -141,7 +45,7 @@ blk_end_request_x(struct request *req, int error, unsigned int nr_bytes)
  * that long term this function will be opened up.
  */
 #if defined(HAVE_BLK_QUEUE_FLUSH) && defined(HAVE_BLK_QUEUE_FLUSH_GPL_ONLY)
-#define blk_queue_flush __blk_queue_flush
+#define	blk_queue_flush __blk_queue_flush
 static inline void
 __blk_queue_flush(struct request_queue *q, unsigned int flags)
 {
@@ -149,35 +53,31 @@ __blk_queue_flush(struct request_queue *q, unsigned int flags)
 }
 #endif /* HAVE_BLK_QUEUE_FLUSH && HAVE_BLK_QUEUE_FLUSH_GPL_ONLY */
 
-#ifndef HAVE_BLK_RQ_POS
-static inline sector_t
-blk_rq_pos(struct request *req)
-{
-	return req->sector;
-}
-#endif /* HAVE_BLK_RQ_POS */
-
-#ifndef HAVE_BLK_RQ_SECTORS
-static inline unsigned int
-blk_rq_sectors(struct request *req)
-{
-	return req->nr_sectors;
-}
-#endif /* HAVE_BLK_RQ_SECTORS */
-
-#if !defined(HAVE_BLK_RQ_BYTES) || defined(HAVE_BLK_RQ_BYTES_GPL_ONLY)
 /*
- * Define required to avoid conflicting 2.6.29 non-static prototype for a
- * GPL-only version of the helper.  As of 2.6.31 the helper is available
- * to non-GPL modules in the form of a static inline in the header.
+ * 4.7 API change,
+ * The blk_queue_write_cache() interface has replaced blk_queue_flush()
+ * interface.  However, while the new interface is GPL-only. Thus if the
+ * GPL-only version is detected we implement our own trivial helper
+ * compatibility funcion.
  */
-#define blk_rq_bytes __blk_rq_bytes
-static inline unsigned int
-__blk_rq_bytes(struct request *req)
+#if defined(HAVE_BLK_QUEUE_WRITE_CACHE) && \
+	defined(HAVE_BLK_QUEUE_WRITE_CACHE_GPL_ONLY)
+#define	blk_queue_write_cache __blk_queue_write_cache
+static inline void
+__blk_queue_write_cache(struct request_queue *q, bool wc, bool fua)
 {
-	return blk_rq_sectors(req) << 9;
+	spin_lock_irq(q->queue_lock);
+	if (wc)
+		queue_flag_set(QUEUE_FLAG_WC, q);
+	else
+		queue_flag_clear(QUEUE_FLAG_WC, q);
+	if (fua)
+		queue_flag_set(QUEUE_FLAG_FUA, q);
+	else
+		queue_flag_clear(QUEUE_FLAG_FUA, q);
+	spin_unlock_irq(q->queue_lock);
 }
-#endif /* !HAVE_BLK_RQ_BYTES || HAVE_BLK_RQ_BYTES_GPL_ONLY */
+#endif
 
 /*
  * Most of the blk_* macros were removed in 2.6.36.  Ostensibly this was
@@ -186,7 +86,7 @@ __blk_rq_bytes(struct request *req)
  * macros are redefined here if they are missing from the kernel.
  */
 #ifndef blk_fs_request
-#define blk_fs_request(rq)	((rq)->cmd_type == REQ_TYPE_FS)
+#define	blk_fs_request(rq)	((rq)->cmd_type == REQ_TYPE_FS)
 #endif
 
 /*
@@ -197,7 +97,7 @@ __blk_rq_bytes(struct request *req)
  * this legacy behavior.
  */
 #ifndef blk_queue_stackable
-#define blk_queue_stackable(q)	((q)->request_fn == NULL)
+#define	blk_queue_stackable(q)	((q)->request_fn == NULL)
 #endif
 
 /*
@@ -205,7 +105,7 @@ __blk_rq_bytes(struct request *req)
  * The blk_queue_max_hw_sectors() function replaces blk_queue_max_sectors().
  */
 #ifndef HAVE_BLK_QUEUE_MAX_HW_SECTORS
-#define blk_queue_max_hw_sectors __blk_queue_max_hw_sectors
+#define	blk_queue_max_hw_sectors __blk_queue_max_hw_sectors
 static inline void
 __blk_queue_max_hw_sectors(struct request_queue *q, unsigned int max_hw_sectors)
 {
@@ -219,32 +119,13 @@ __blk_queue_max_hw_sectors(struct request_queue *q, unsigned int max_hw_sectors)
  * blk_queue_max_hw_segments() and blk_queue_max_phys_segments().
  */
 #ifndef HAVE_BLK_QUEUE_MAX_SEGMENTS
-#define blk_queue_max_segments __blk_queue_max_segments
+#define	blk_queue_max_segments __blk_queue_max_segments
 static inline void
 __blk_queue_max_segments(struct request_queue *q, unsigned short max_segments)
 {
 	blk_queue_max_phys_segments(q, max_segments);
 	blk_queue_max_hw_segments(q, max_segments);
 }
-#endif
-
-/*
- * 2.6.30 API change,
- * The blk_queue_physical_block_size() function was introduced to
- * indicate the smallest I/O the device can write without incurring
- * a read-modify-write penalty.  For older kernels this is a no-op.
- */
-#ifndef HAVE_BLK_QUEUE_PHYSICAL_BLOCK_SIZE
-#define blk_queue_physical_block_size(q, x)	((void)(0))
-#endif
-
-/*
- * 2.6.30 API change,
- * The blk_queue_io_opt() function was added to indicate the optimal
- * I/O size for the device.  For older kernels this is a no-op.
- */
-#ifndef HAVE_BLK_QUEUE_IO_OPT
-#define blk_queue_io_opt(q, x)			((void)(0))
 #endif
 
 #ifndef HAVE_GET_DISK_RO
@@ -256,35 +137,27 @@ get_disk_ro(struct gendisk *disk)
 	if (disk->part[0])
 		policy = disk->part[0]->policy;
 
-	return policy;
+	return (policy);
 }
 #endif /* HAVE_GET_DISK_RO */
 
-#ifndef HAVE_RQ_IS_SYNC
-static inline bool
-rq_is_sync(struct request *req)
-{
-	return (req->flags & REQ_RW_SYNC);
-}
-#endif /* HAVE_RQ_IS_SYNC */
-
-#ifndef HAVE_RQ_FOR_EACH_SEGMENT
-struct req_iterator {
-	int i;
-	struct bio *bio;
-};
-
-# define for_each_bio(_bio)              \
-	for (; _bio; _bio = _bio->bi_next)
-
-# define __rq_for_each_bio(_bio, rq)    \
-	if ((rq->bio))                  \
-		for (_bio = (rq)->bio; _bio; _bio = _bio->bi_next)
-
-# define rq_for_each_segment(bvl, _rq, _iter)                   \
-	__rq_for_each_bio(_iter.bio, _rq)                       \
-		bio_for_each_segment(bvl, _iter.bio, _iter.i)
-#endif /* HAVE_RQ_FOR_EACH_SEGMENT */
+#ifdef HAVE_BIO_BVEC_ITER
+#define	BIO_BI_SECTOR(bio)	(bio)->bi_iter.bi_sector
+#define	BIO_BI_SIZE(bio)	(bio)->bi_iter.bi_size
+#define	BIO_BI_IDX(bio)		(bio)->bi_iter.bi_idx
+#define	BIO_BI_SKIP(bio)	(bio)->bi_iter.bi_bvec_done
+#define	bio_for_each_segment4(bv, bvp, b, i)	\
+	bio_for_each_segment((bv), (b), (i))
+typedef struct bvec_iter bvec_iterator_t;
+#else
+#define	BIO_BI_SECTOR(bio)	(bio)->bi_sector
+#define	BIO_BI_SIZE(bio)	(bio)->bi_size
+#define	BIO_BI_IDX(bio)		(bio)->bi_idx
+#define	BIO_BI_SKIP(bio)	(0)
+#define	bio_for_each_segment4(bv, bvp, b, i)	\
+	bio_for_each_segment((bvp), (b), (i))
+typedef int bvec_iterator_t;
+#endif
 
 /*
  * Portable helper for correctly setting the FAILFAST flags.  The
@@ -313,46 +186,42 @@ bio_set_flags_failfast(struct block_device *bdev, int *flags)
 #endif /* BLOCK_EXT_MAJOR */
 #endif /* CONFIG_BUG */
 
-#ifdef HAVE_BIO_RW_FAILFAST_DTD
+#if defined(HAVE_BIO_RW_FAILFAST_DTD)
 	/* BIO_RW_FAILFAST_* preferred interface from 2.6.28 - 2.6.35 */
-	*flags |=
-	    ((1 << BIO_RW_FAILFAST_DEV) |
-	     (1 << BIO_RW_FAILFAST_TRANSPORT) |
-	     (1 << BIO_RW_FAILFAST_DRIVER));
-#else
-# ifdef HAVE_BIO_RW_FAILFAST
-	/* BIO_RW_FAILFAST preferred interface from 2.6.12 - 2.6.27 */
-	*flags |= (1 << BIO_RW_FAILFAST);
-# else
-#  ifdef HAVE_REQ_FAILFAST_MASK
-	/* REQ_FAILFAST_* preferred interface from 2.6.36 - 2.6.xx,
-	 * the BIO_* and REQ_* flags were unified under REQ_* flags. */
+	*flags |= (
+	    (1 << BIO_RW_FAILFAST_DEV) |
+	    (1 << BIO_RW_FAILFAST_TRANSPORT) |
+	    (1 << BIO_RW_FAILFAST_DRIVER));
+#elif defined(HAVE_REQ_FAILFAST_MASK)
+	/*
+	 * REQ_FAILFAST_* preferred interface from 2.6.36 - 2.6.xx,
+	 * the BIO_* and REQ_* flags were unified under REQ_* flags.
+	 */
 	*flags |= REQ_FAILFAST_MASK;
-#  endif /* HAVE_REQ_FAILFAST_MASK */
-# endif /* HAVE_BIO_RW_FAILFAST */
-#endif /* HAVE_BIO_RW_FAILFAST_DTD */
+#else
+#error "Undefined block IO FAILFAST interface."
+#endif
 }
 
 /*
  * Maximum disk label length, it may be undefined for some kernels.
  */
 #ifndef DISK_NAME_LEN
-#define DISK_NAME_LEN	32
+#define	DISK_NAME_LEN	32
 #endif /* DISK_NAME_LEN */
 
 /*
- * 2.6.24 API change,
- * The bio_end_io() prototype changed slightly.  These are helper
- * macro's to ensure the prototype and return value are handled.
+ * 4.3 API change
+ * The bio_endio() prototype changed slightly.  These are helper
+ * macro's to ensure the prototype and invocation are handled.
  */
-#ifdef HAVE_2ARGS_BIO_END_IO_T
-# define BIO_END_IO_PROTO(fn, x, y, z)	static void fn(struct bio *x, int z)
-# define BIO_END_IO_RETURN(rc)		return
+#ifdef HAVE_1ARG_BIO_END_IO_T
+#define	BIO_END_IO_PROTO(fn, x, z)	static void fn(struct bio *x)
+#define	BIO_END_IO(bio, error)		bio->bi_error = error; bio_endio(bio);
 #else
-# define BIO_END_IO_PROTO(fn, x, y, z)	static int fn(struct bio *x, \
-					              unsigned int y, int z)
-# define BIO_END_IO_RETURN(rc)		return rc
-#endif /* HAVE_2ARGS_BIO_END_IO_T */
+#define	BIO_END_IO_PROTO(fn, x, z)	static void fn(struct bio *x, int z)
+#define	BIO_END_IO(bio, error)		bio_endio(bio, error);
+#endif /* HAVE_1ARG_BIO_END_IO_T */
 
 /*
  * 2.6.38 - 2.6.x API,
@@ -370,15 +239,15 @@ bio_set_flags_failfast(struct block_device *bdev, int *flags)
  * Used to exclusively open a block device from within the kernel.
  */
 #if defined(HAVE_BLKDEV_GET_BY_PATH)
-# define vdev_bdev_open(path, md, hld)	blkdev_get_by_path(path, \
+#define	vdev_bdev_open(path, md, hld)	blkdev_get_by_path(path, \
 					    (md) | FMODE_EXCL, hld)
-# define vdev_bdev_close(bdev, md)	blkdev_put(bdev, (md) | FMODE_EXCL)
+#define	vdev_bdev_close(bdev, md)	blkdev_put(bdev, (md) | FMODE_EXCL)
 #elif defined(HAVE_OPEN_BDEV_EXCLUSIVE)
-# define vdev_bdev_open(path, md, hld)	open_bdev_exclusive(path, md, hld)
-# define vdev_bdev_close(bdev, md)	close_bdev_exclusive(bdev, md)
+#define	vdev_bdev_open(path, md, hld)	open_bdev_exclusive(path, md, hld)
+#define	vdev_bdev_close(bdev, md)	close_bdev_exclusive(bdev, md)
 #else
-# define vdev_bdev_open(path, md, hld)	open_bdev_excl(path, md, hld)
-# define vdev_bdev_close(bdev, md)	close_bdev_excl(bdev)
+#define	vdev_bdev_open(path, md, hld)	open_bdev_excl(path, md, hld)
+#define	vdev_bdev_close(bdev, md)	close_bdev_excl(bdev)
 #endif /* HAVE_BLKDEV_GET_BY_PATH | HAVE_OPEN_BDEV_EXCLUSIVE */
 
 /*
@@ -387,20 +256,43 @@ bio_set_flags_failfast(struct block_device *bdev, int *flags)
  * it was unused.
  */
 #ifdef HAVE_1ARG_INVALIDATE_BDEV
-# define vdev_bdev_invalidate(bdev)	invalidate_bdev(bdev)
+#define	vdev_bdev_invalidate(bdev)	invalidate_bdev(bdev)
 #else
-# define vdev_bdev_invalidate(bdev)	invalidate_bdev(bdev, 1)
+#define	vdev_bdev_invalidate(bdev)	invalidate_bdev(bdev, 1)
 #endif /* HAVE_1ARG_INVALIDATE_BDEV */
 
 /*
- * 2.6.30 API change
- * Change to make it explicit there this is the logical block size.
+ * 2.6.27 API change
+ * The function was exported for use, prior to this it existed by the
+ * symbol was not exported.
  */
-#ifdef HAVE_BDEV_LOGICAL_BLOCK_SIZE
-# define vdev_bdev_block_size(bdev)	bdev_logical_block_size(bdev)
-#else
-# define vdev_bdev_block_size(bdev)	bdev_hardsect_size(bdev)
+#ifndef HAVE_LOOKUP_BDEV
+#define	lookup_bdev(path)		ERR_PTR(-ENOTSUP)
 #endif
+
+/*
+ * 2.6.30 API change
+ * To ensure good performance preferentially use the physical block size
+ * for proper alignment.  The physical size is supposed to be the internal
+ * sector size used by the device.  This is often 4096 byte for AF devices,
+ * while a smaller 512 byte logical size is supported for compatibility.
+ *
+ * Unfortunately, many drives still misreport their physical sector size.
+ * For devices which are known to lie you may need to manually set this
+ * at pool creation time with 'zpool create -o ashift=12 ...'.
+ *
+ * When the physical block size interface isn't available, we fall back to
+ * the logical block size interface and then the older hard sector size.
+ */
+#ifdef HAVE_BDEV_PHYSICAL_BLOCK_SIZE
+#define	vdev_bdev_block_size(bdev)	bdev_physical_block_size(bdev)
+#else
+#ifdef HAVE_BDEV_LOGICAL_BLOCK_SIZE
+#define	vdev_bdev_block_size(bdev)	bdev_logical_block_size(bdev)
+#else
+#define	vdev_bdev_block_size(bdev)	bdev_hardsect_size(bdev)
+#endif /* HAVE_BDEV_LOGICAL_BLOCK_SIZE */
+#endif /* HAVE_BDEV_PHYSICAL_BLOCK_SIZE */
 
 /*
  * 2.6.37 API change
@@ -415,22 +307,50 @@ bio_set_flags_failfast(struct block_device *bdev, int *flags)
  * compatibility macros.
  */
 #ifdef WRITE_FLUSH_FUA
-# define VDEV_WRITE_FLUSH_FUA		WRITE_FLUSH_FUA
-# define VDEV_REQ_FLUSH			REQ_FLUSH
-# define VDEV_REQ_FUA			REQ_FUA
+#define	VDEV_WRITE_FLUSH_FUA		WRITE_FLUSH_FUA
+#define	VDEV_REQ_FLUSH			REQ_FLUSH
+#define	VDEV_REQ_FUA			REQ_FUA
 #else
-# define VDEV_WRITE_FLUSH_FUA		WRITE_BARRIER
-# define VDEV_REQ_FLUSH			REQ_HARDBARRIER
-# define VDEV_REQ_FUA			REQ_HARDBARRIER
+#define	VDEV_WRITE_FLUSH_FUA		WRITE_BARRIER
+#ifdef HAVE_BIO_RW_BARRIER
+#define	VDEV_REQ_FLUSH			(1 << BIO_RW_BARRIER)
+#define	VDEV_REQ_FUA			(1 << BIO_RW_BARRIER)
+#else
+#define	VDEV_REQ_FLUSH			REQ_HARDBARRIER
+#define	VDEV_REQ_FUA			REQ_FUA
+#endif
 #endif
 
 /*
  * 2.6.32 API change
  * Use the normal I/O patch for discards.
  */
-#ifdef REQ_DISCARD
-# define VDEV_REQ_DISCARD		REQ_DISCARD
+#ifdef QUEUE_FLAG_DISCARD
+#ifdef HAVE_BIO_RW_DISCARD
+#define	VDEV_REQ_DISCARD		(1 << BIO_RW_DISCARD)
+#else
+#define	VDEV_REQ_DISCARD		REQ_DISCARD
 #endif
+#else
+#error	"Allowing the build will cause discard requests to become writes "
+	"potentially triggering the DMU_MAX_ACCESS assertion. Please file a "
+	"an issue report at: https://github.com/zfsonlinux/zfs/issues/new"
+#endif
+
+/*
+ * 2.6.33 API change
+ * Discard granularity and alignment restrictions may now be set.  For
+ * older kernels which do not support this it is safe to skip it.
+ */
+#ifdef HAVE_DISCARD_GRANULARITY
+static inline void
+blk_queue_discard_granularity(struct request_queue *q, unsigned int dg)
+{
+	q->limits.discard_granularity = dg;
+}
+#else
+#define	blk_queue_discard_granularity(x, dg)	((void)0)
+#endif /* HAVE_DISCARD_GRANULARITY */
 
 /*
  * Default Linux IO Scheduler,
@@ -439,5 +359,19 @@ bio_set_flags_failfast(struct block_device *bdev, int *flags)
  * ordering and prioritization to the ZFS IO scheduler.
  */
 #define	VDEV_SCHEDULER			"noop"
+
+/*
+ * A common holder for vdev_bdev_open() is used to relax the exclusive open
+ * semantics slightly.  Internal vdev disk callers may pass VDEV_HOLDER to
+ * allow them to open the device multiple times.  Other kernel callers and
+ * user space processes which don't pass this value will get EBUSY.  This is
+ * currently required for the correct operation of hot spares.
+ */
+#define	VDEV_HOLDER			((void *)0x2401de7)
+
+#ifndef HAVE_GENERIC_IO_ACCT
+#define	generic_start_io_acct(rw, slen, part)		((void)0)
+#define	generic_end_io_acct(rw, part, start_jiffies)	((void)0)
+#endif
 
 #endif /* _ZFS_BLKDEV_H */

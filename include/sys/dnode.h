@@ -20,6 +20,8 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  */
 
 #ifndef	_SYS_DNODE_H
@@ -55,7 +57,7 @@ extern "C" {
  * Fixed constants.
  */
 #define	DNODE_SHIFT		9	/* 512 bytes */
-#define	DN_MIN_INDBLKSHIFT	10	/* 1k */
+#define	DN_MIN_INDBLKSHIFT	12	/* 4k */
 #define	DN_MAX_INDBLKSHIFT	14	/* 16k */
 #define	DNODE_BLOCK_SHIFT	14	/* 16k */
 #define	DNODE_CORE_SIZE		64	/* 64 bytes for dnode sans blkptrs */
@@ -77,11 +79,18 @@ extern "C" {
 /*
  * Derived constants.
  */
-#define	DNODE_SIZE	(1 << DNODE_SHIFT)
-#define	DN_MAX_NBLKPTR	((DNODE_SIZE - DNODE_CORE_SIZE) >> SPA_BLKPTRSHIFT)
-#define	DN_MAX_BONUSLEN	(DNODE_SIZE - DNODE_CORE_SIZE - (1 << SPA_BLKPTRSHIFT))
+#define	DNODE_MIN_SIZE		(1 << DNODE_SHIFT)
+#define	DNODE_MAX_SIZE		(1 << DNODE_BLOCK_SHIFT)
+#define	DNODE_BLOCK_SIZE	(1 << DNODE_BLOCK_SHIFT)
+#define	DNODE_MIN_SLOTS		(DNODE_MIN_SIZE >> DNODE_SHIFT)
+#define	DNODE_MAX_SLOTS		(DNODE_MAX_SIZE >> DNODE_SHIFT)
+#define	DN_BONUS_SIZE(dnsize)	((dnsize) - DNODE_CORE_SIZE - \
+	(1 << SPA_BLKPTRSHIFT))
+#define	DN_SLOTS_TO_BONUSLEN(slots)	DN_BONUS_SIZE((slots) << DNODE_SHIFT)
+#define	DN_OLD_MAX_BONUSLEN	(DN_BONUS_SIZE(DNODE_MIN_SIZE))
+#define	DN_MAX_NBLKPTR	((DNODE_MIN_SIZE - DNODE_CORE_SIZE) >> SPA_BLKPTRSHIFT)
 #define	DN_MAX_OBJECT	(1ULL << DN_MAX_OBJECT_SHIFT)
-#define	DN_ZERO_BONUSLEN	(DN_MAX_BONUSLEN + 1)
+#define	DN_ZERO_BONUSLEN	(DN_BONUS_SIZE(DNODE_MAX_SIZE) + 1)
 #define	DN_KILL_SPILLBLK (1)
 
 #define	DNODES_PER_BLOCK_SHIFT	(DNODE_BLOCK_SHIFT - DNODE_SHIFT)
@@ -129,7 +138,8 @@ typedef struct dnode_phys {
 	uint8_t dn_flags;		/* DNODE_FLAG_* */
 	uint16_t dn_datablkszsec;	/* data block size in 512b sectors */
 	uint16_t dn_bonuslen;		/* length of dn_bonus */
-	uint8_t dn_pad2[4];
+	uint8_t dn_extra_slots;		/* # of subsequent slots consumed */
+	uint8_t dn_pad2[3];
 
 	/* accounting is protected by dn_dirty_mtx */
 	uint64_t dn_maxblkid;		/* largest allocated block ID */
@@ -137,16 +147,44 @@ typedef struct dnode_phys {
 
 	uint64_t dn_pad3[4];
 
-	blkptr_t dn_blkptr[1];
-	uint8_t dn_bonus[DN_MAX_BONUSLEN - sizeof (blkptr_t)];
-	blkptr_t dn_spill;
+	/*
+	 * The tail region is 448 bytes for a 512 byte dnode, and
+	 * correspondingly larger for larger dnode sizes. The spill
+	 * block pointer, when present, is always at the end of the tail
+	 * region. There are three ways this space may be used, using
+	 * a 512 byte dnode for this diagram:
+	 *
+	 * 0       64      128     192     256     320     384     448 (offset)
+	 * +---------------+---------------+---------------+-------+
+	 * | dn_blkptr[0]  | dn_blkptr[1]  | dn_blkptr[2]  | /     |
+	 * +---------------+---------------+---------------+-------+
+	 * | dn_blkptr[0]  | dn_bonus[0..319]                      |
+	 * +---------------+-----------------------+---------------+
+	 * | dn_blkptr[0]  | dn_bonus[0..191]      | dn_spill      |
+	 * +---------------+-----------------------+---------------+
+	 */
+	union {
+		blkptr_t dn_blkptr[1+DN_OLD_MAX_BONUSLEN/sizeof (blkptr_t)];
+		struct {
+			blkptr_t __dn_ignore1;
+			uint8_t dn_bonus[DN_OLD_MAX_BONUSLEN];
+		};
+		struct {
+			blkptr_t __dn_ignore2;
+			uint8_t __dn_ignore3[DN_OLD_MAX_BONUSLEN -
+			    sizeof (blkptr_t)];
+			blkptr_t dn_spill;
+		};
+	};
 } dnode_phys_t;
+
+#define	DN_SPILL_BLKPTR(dnp)	(blkptr_t *)((char *)(dnp) + \
+	(((dnp)->dn_extra_slots + 1) << DNODE_SHIFT) - (1 << SPA_BLKPTRSHIFT))
 
 typedef struct dnode {
 	/*
-	 * dn_struct_rwlock protects the structure of the dnode,
-	 * including the number of levels of indirection (dn_nlevels),
-	 * dn_maxblkid, and dn_next_*
+	 * Protects the structure of the dnode, including the number of levels
+	 * of indirection (dn_nlevels), dn_maxblkid, and dn_next_*
 	 */
 	krwlock_t dn_struct_rwlock;
 
@@ -178,6 +216,8 @@ typedef struct dnode {
 	uint16_t dn_datablkszsec;	/* in 512b sectors */
 	uint32_t dn_datablksz;		/* in bytes */
 	uint64_t dn_maxblkid;
+	uint8_t dn_next_type[TXG_SIZE];
+	uint8_t dn_num_slots;		/* metadnode slots consumed on disk */
 	uint8_t dn_next_nblkptr[TXG_SIZE];
 	uint8_t dn_next_nlevels[TXG_SIZE];
 	uint8_t dn_next_indblkshift[TXG_SIZE];
@@ -188,6 +228,8 @@ typedef struct dnode {
 
 	/* protected by dn_dbufs_mtx; declared here to fill 32-bit hole */
 	uint32_t dn_dbufs_count;	/* count of dn_dbufs */
+	/* There are no level-0 blocks of this blkid or higher in dn_dbufs */
+	uint64_t dn_unlisted_l0_blkid;
 
 	/* protected by os_lock: */
 	list_node_t dn_dirty_link[TXG_SIZE];	/* next on dataset's dirty */
@@ -195,7 +237,7 @@ typedef struct dnode {
 	/* protected by dn_mtx: */
 	kmutex_t dn_mtx;
 	list_t dn_dirty_records[TXG_SIZE];
-	avl_tree_t dn_ranges[TXG_SIZE];
+	struct range_tree *dn_free_ranges[TXG_SIZE];
 	uint64_t dn_allocated_txg;
 	uint64_t dn_free_txg;
 	uint64_t dn_assigned_txg;
@@ -208,7 +250,18 @@ typedef struct dnode {
 	refcount_t dn_holds;
 
 	kmutex_t dn_dbufs_mtx;
-	list_t dn_dbufs;		/* descendent dbufs */
+	/*
+	 * Descendent dbufs, ordered by dbuf_compare. Note that dn_dbufs
+	 * can contain multiple dbufs of the same (level, blkid) when a
+	 * dbuf is marked DB_EVICTING without being removed from
+	 * dn_dbufs. To maintain the avl invariant that there cannot be
+	 * duplicate entries, we order the dbufs by an arbitrary value -
+	 * their address in memory. This means that dn_dbufs cannot be used to
+	 * directly look up a dbuf. Instead, callers must use avl_walk, have
+	 * a reference to the dbuf, or look up a non-existant node with
+	 * db_state = DB_SEARCH (see dbuf_free_range for an example).
+	 */
+	avl_tree_t dn_dbufs;
 
 	/* protected by dn_struct_rwlock */
 	struct dmu_buf_impl *dn_bonus;	/* bonus buffer dbuf */
@@ -241,8 +294,9 @@ typedef struct dnode_handle {
 } dnode_handle_t;
 
 typedef struct dnode_children {
+	dmu_buf_user_t dnc_dbu;		/* User evict data */
 	size_t dnc_count;		/* number of children */
-	dnode_handle_t dnc_children[1];	/* sized dynamically */
+	dnode_handle_t dnc_children[];	/* sized dynamically */
 } dnode_children_t;
 
 typedef struct free_range {
@@ -251,7 +305,7 @@ typedef struct free_range {
 	uint64_t fr_nblks;
 } free_range_t;
 
-dnode_t *dnode_special_open(struct objset *dd, dnode_phys_t *dnp,
+void dnode_special_open(struct objset *dd, dnode_phys_t *dnp,
     uint64_t object, dnode_handle_t *dnh);
 void dnode_special_close(dnode_handle_t *dnh);
 
@@ -261,25 +315,23 @@ void dnode_rm_spill(dnode_t *dn, dmu_tx_t *tx);
 
 int dnode_hold(struct objset *dd, uint64_t object,
     void *ref, dnode_t **dnp);
-int dnode_hold_impl(struct objset *dd, uint64_t object, int flag,
+int dnode_hold_impl(struct objset *dd, uint64_t object, int flag, int dn_slots,
     void *ref, dnode_t **dnp);
 boolean_t dnode_add_ref(dnode_t *dn, void *ref);
 void dnode_rele(dnode_t *dn, void *ref);
+void dnode_rele_and_unlock(dnode_t *dn, void *tag);
 void dnode_setdirty(dnode_t *dn, dmu_tx_t *tx);
 void dnode_sync(dnode_t *dn, dmu_tx_t *tx);
 void dnode_allocate(dnode_t *dn, dmu_object_type_t ot, int blocksize, int ibs,
-    dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+    dmu_object_type_t bonustype, int bonuslen, int dn_slots, dmu_tx_t *tx);
 void dnode_reallocate(dnode_t *dn, dmu_object_type_t ot, int blocksize,
-    dmu_object_type_t bonustype, int bonuslen, dmu_tx_t *tx);
+    dmu_object_type_t bonustype, int bonuslen, int dn_slots, dmu_tx_t *tx);
 void dnode_free(dnode_t *dn, dmu_tx_t *tx);
 void dnode_byteswap(dnode_phys_t *dnp);
 void dnode_buf_byteswap(void *buf, size_t size);
 void dnode_verify(dnode_t *dn);
 int dnode_set_blksz(dnode_t *dn, uint64_t size, int ibs, dmu_tx_t *tx);
-uint64_t dnode_current_max_length(dnode_t *dn);
 void dnode_free_range(dnode_t *dn, uint64_t off, uint64_t len, dmu_tx_t *tx);
-void dnode_clear_range(dnode_t *dn, uint64_t blkid,
-    uint64_t nblks, dmu_tx_t *tx);
 void dnode_diduse_space(dnode_t *dn, int64_t space);
 void dnode_willuse_space(dnode_t *dn, int64_t space, dmu_tx_t *tx);
 void dnode_new_blkid(dnode_t *dn, uint64_t blkid, dmu_tx_t *tx, boolean_t);
@@ -289,6 +341,7 @@ void dnode_fini(void);
 int dnode_next_offset(dnode_t *dn, int flags, uint64_t *off,
     int minlvl, uint64_t blkfill, uint64_t txg);
 void dnode_evict_dbufs(dnode_t *dn);
+void dnode_evict_bonus(dnode_t *dn);
 
 #ifdef ZFS_DEBUG
 

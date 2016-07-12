@@ -43,88 +43,57 @@ zpl_common_open(struct inode *ip, struct file *filp)
 	if (filp->f_mode & FMODE_WRITE)
 		return (-EACCES);
 
-	return generic_file_open(ip, filp);
-}
-
-static int
-zpl_common_readdir(struct file *filp, void *dirent, filldir_t filldir)
-{
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *ip = dentry->d_inode;
-	int error = 0;
-
-	switch (filp->f_pos) {
-	case 0:
-		error = filldir(dirent, ".", 1, 0, ip->i_ino, DT_DIR);
-		if (error)
-			break;
-
-		filp->f_pos++;
-		/* fall-thru */
-	case 1:
-		error = filldir(dirent, "..", 2, 1, parent_ino(dentry), DT_DIR);
-		if (error)
-			break;
-
-		filp->f_pos++;
-		/* fall-thru */
-	default:
-		break;
-	}
-
-	return (error);
+	return (generic_file_open(ip, filp));
 }
 
 /*
  * Get root directory contents.
  */
 static int
-zpl_root_readdir(struct file *filp, void *dirent, filldir_t filldir)
+zpl_root_iterate(struct file *filp, struct dir_context *ctx)
 {
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *ip = dentry->d_inode;
-	zfs_sb_t *zsb = ITOZSB(ip);
+	zfs_sb_t *zsb = ITOZSB(filp->f_path.dentry->d_inode);
 	int error = 0;
 
 	ZFS_ENTER(zsb);
 
-	switch (filp->f_pos) {
-	case 0:
-		error = filldir(dirent, ".", 1, 0, ip->i_ino, DT_DIR);
-		if (error)
+	if (!dir_emit_dots(filp, ctx))
+		goto out;
+
+	if (ctx->pos == 2) {
+		if (!dir_emit(ctx, ZFS_SNAPDIR_NAME, strlen(ZFS_SNAPDIR_NAME),
+		    ZFSCTL_INO_SNAPDIR, DT_DIR))
 			goto out;
 
-		filp->f_pos++;
-		/* fall-thru */
-	case 1:
-		error = filldir(dirent, "..", 2, 1, parent_ino(dentry), DT_DIR);
-		if (error)
+		ctx->pos++;
+	}
+
+	if (ctx->pos == 3) {
+		if (!dir_emit(ctx, ZFS_SHAREDIR_NAME, strlen(ZFS_SHAREDIR_NAME),
+		    ZFSCTL_INO_SHARES, DT_DIR))
 			goto out;
 
-		filp->f_pos++;
-		/* fall-thru */
-	case 2:
-		error = filldir(dirent, ZFS_SNAPDIR_NAME,
-		    strlen(ZFS_SNAPDIR_NAME), 2, ZFSCTL_INO_SNAPDIR, DT_DIR);
-		if (error)
-			goto out;
-
-		filp->f_pos++;
-		/* fall-thru */
-	case 3:
-		error = filldir(dirent, ZFS_SHAREDIR_NAME,
-		    strlen(ZFS_SHAREDIR_NAME), 3, ZFSCTL_INO_SHARES, DT_DIR);
-		if (error)
-			goto out;
-
-		filp->f_pos++;
-		/* fall-thru */
+		ctx->pos++;
 	}
 out:
 	ZFS_EXIT(zsb);
 
 	return (error);
 }
+
+#if !defined(HAVE_VFS_ITERATE) && !defined(HAVE_VFS_ITERATE_SHARED)
+static int
+zpl_root_readdir(struct file *filp, void *dirent, filldir_t filldir)
+{
+	struct dir_context ctx = DIR_CONTEXT_INIT(dirent, filldir, filp->f_pos);
+	int error;
+
+	error = zpl_root_iterate(filp, &ctx);
+	filp->f_pos = ctx.pos;
+
+	return (error);
+}
+#endif /* HAVE_VFS_ITERATE */
 
 /*
  * Get root directory attributes.
@@ -143,7 +112,11 @@ zpl_root_getattr(struct vfsmount *mnt, struct dentry *dentry,
 }
 
 static struct dentry *
+#ifdef HAVE_LOOKUP_NAMEIDATA
 zpl_root_lookup(struct inode *dip, struct dentry *dentry, struct nameidata *nd)
+#else
+zpl_root_lookup(struct inode *dip, struct dentry *dentry, unsigned int flags)
+#endif
 {
 	cred_t *cr = CRED();
 	struct inode *ip;
@@ -156,12 +129,12 @@ zpl_root_lookup(struct inode *dip, struct dentry *dentry, struct nameidata *nd)
 
 	if (error) {
 		if (error == -ENOENT)
-			return d_splice_alias(NULL, dentry);
+			return (d_splice_alias(NULL, dentry));
 		else
-			return ERR_PTR(error);
+			return (ERR_PTR(error));
 	}
 
-        return d_splice_alias(ip, dentry);
+	return (d_splice_alias(ip, dentry));
 }
 
 /*
@@ -171,7 +144,13 @@ const struct file_operations zpl_fops_root = {
 	.open		= zpl_common_open,
 	.llseek		= generic_file_llseek,
 	.read		= generic_read_dir,
+#ifdef HAVE_VFS_ITERATE_SHARED
+	.iterate_shared	= zpl_root_iterate,
+#elif defined(HAVE_VFS_ITERATE)
+	.iterate	= zpl_root_iterate,
+#else
 	.readdir	= zpl_root_readdir,
+#endif
 };
 
 const struct inode_operations zpl_ops_root = {
@@ -179,88 +158,127 @@ const struct inode_operations zpl_ops_root = {
 	.getattr	= zpl_root_getattr,
 };
 
+#ifdef HAVE_AUTOMOUNT
+static struct vfsmount *
+zpl_snapdir_automount(struct path *path)
+{
+	int error;
+
+	error = -zfsctl_snapshot_mount(path, 0);
+	if (error)
+		return (ERR_PTR(error));
+
+	/*
+	 * Rather than returning the new vfsmount for the snapshot we must
+	 * return NULL to indicate a mount collision.  This is done because
+	 * the user space mount calls do_add_mount() which adds the vfsmount
+	 * to the name space.  If we returned the new mount here it would be
+	 * added again to the vfsmount list resulting in list corruption.
+	 */
+	return (NULL);
+}
+#endif /* HAVE_AUTOMOUNT */
+
+/*
+ * Negative dentries must always be revalidated so newly created snapshots
+ * can be detected and automounted.  Normal dentries should be kept because
+ * as of the 3.18 kernel revaliding the mountpoint dentry will result in
+ * the snapshot being immediately unmounted.
+ */
+static int
+#ifdef HAVE_D_REVALIDATE_NAMEIDATA
+zpl_snapdir_revalidate(struct dentry *dentry, struct nameidata *i)
+#else
+zpl_snapdir_revalidate(struct dentry *dentry, unsigned int flags)
+#endif
+{
+	return (!!dentry->d_inode);
+}
+
+dentry_operations_t zpl_dops_snapdirs = {
+/*
+ * Auto mounting of snapshots is only supported for 2.6.37 and
+ * newer kernels.  Prior to this kernel the ops->follow_link()
+ * callback was used as a hack to trigger the mount.  The
+ * resulting vfsmount was then explicitly grafted in to the
+ * name space.  While it might be possible to add compatibility
+ * code to accomplish this it would require considerable care.
+ */
+#ifdef HAVE_AUTOMOUNT
+	.d_automount	= zpl_snapdir_automount,
+#endif /* HAVE_AUTOMOUNT */
+	.d_revalidate	= zpl_snapdir_revalidate,
+};
+
 static struct dentry *
+#ifdef HAVE_LOOKUP_NAMEIDATA
 zpl_snapdir_lookup(struct inode *dip, struct dentry *dentry,
     struct nameidata *nd)
+#else
+zpl_snapdir_lookup(struct inode *dip, struct dentry *dentry,
+    unsigned int flags)
+#endif
+
 {
+	fstrans_cookie_t cookie;
 	cred_t *cr = CRED();
-	struct inode *ip;
+	struct inode *ip = NULL;
 	int error;
 
 	crhold(cr);
+	cookie = spl_fstrans_mark();
 	error = -zfsctl_snapdir_lookup(dip, dname(dentry), &ip,
 	    0, cr, NULL, NULL);
 	ASSERT3S(error, <=, 0);
+	spl_fstrans_unmark(cookie);
 	crfree(cr);
 
-	if (error) {
-		if (error == -ENOENT)
-			return d_splice_alias(NULL, dentry);
-		else
-			return ERR_PTR(error);
-	}
+	if (error && error != -ENOENT)
+		return (ERR_PTR(error));
 
-	/*
-	 * Auto mounting of snapshots is only supported for 2.6.37 and
-	 * newer kernels.  Prior to this kernel the ops->follow_link()
-	 * callback was used as a hack to trigger the mount.  The
-	 * resulting vfsmount was then explicitly grafted in to the
-	 * name space.  While it might be possible to add compatibility
-	 * code to accomplish this it would require considerable care.
-	 */
+	ASSERT(error == 0 || ip == NULL);
+	d_clear_d_op(dentry);
+	d_set_d_op(dentry, &zpl_dops_snapdirs);
 #ifdef HAVE_AUTOMOUNT
-	dentry->d_op = &zpl_dops_snapdirs;
-#endif /* HAVE_AUTOMOUNT */
+	dentry->d_flags |= DCACHE_NEED_AUTOMOUNT;
+#endif
 
-	return d_splice_alias(ip, dentry);
+	return (d_splice_alias(ip, dentry));
 }
 
-/* ARGSUSED */
 static int
-zpl_snapdir_readdir(struct file *filp, void *dirent, filldir_t filldir)
+zpl_snapdir_iterate(struct file *filp, struct dir_context *ctx)
 {
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *dip = dentry->d_inode;
-	zfs_sb_t *zsb = ITOZSB(dip);
+	zfs_sb_t *zsb = ITOZSB(filp->f_path.dentry->d_inode);
+	fstrans_cookie_t cookie;
 	char snapname[MAXNAMELEN];
-	uint64_t id, cookie;
 	boolean_t case_conflict;
+	uint64_t id, pos;
 	int error = 0;
 
 	ZFS_ENTER(zsb);
+	cookie = spl_fstrans_mark();
 
-	cookie = filp->f_pos;
-	switch (filp->f_pos) {
-	case 0:
-		error = filldir(dirent, ".", 1, 0, dip->i_ino, DT_DIR);
+	if (!dir_emit_dots(filp, ctx))
+		goto out;
+
+	pos = ctx->pos;
+	while (error == 0) {
+		dsl_pool_config_enter(dmu_objset_pool(zsb->z_os), FTAG);
+		error = -dmu_snapshot_list_next(zsb->z_os, MAXNAMELEN,
+		    snapname, &id, &pos, &case_conflict);
+		dsl_pool_config_exit(dmu_objset_pool(zsb->z_os), FTAG);
 		if (error)
 			goto out;
 
-		filp->f_pos++;
-		/* fall-thru */
-	case 1:
-		error = filldir(dirent, "..", 2, 1, parent_ino(dentry), DT_DIR);
-		if (error)
+		if (!dir_emit(ctx, snapname, strlen(snapname),
+		    ZFSCTL_INO_SHARES - id, DT_DIR))
 			goto out;
 
-		filp->f_pos++;
-		/* fall-thru */
-	default:
-		while (error == 0) {
-			error = -dmu_snapshot_list_next(zsb->z_os, MAXNAMELEN,
-			    snapname, &id, &cookie, &case_conflict);
-			if (error)
-				goto out;
-
-			error = filldir(dirent, snapname, strlen(snapname),
-			    filp->f_pos, ZFSCTL_INO_SHARES - id, DT_DIR);
-			if (error)
-				goto out;
-
-			filp->f_pos = cookie;
-		}
+		ctx->pos = pos;
 	}
 out:
+	spl_fstrans_unmark(cookie);
 	ZFS_EXIT(zsb);
 
 	if (error == -ENOENT)
@@ -268,6 +286,20 @@ out:
 
 	return (error);
 }
+
+#if !defined(HAVE_VFS_ITERATE) && !defined(HAVE_VFS_ITERATE_SHARED)
+static int
+zpl_snapdir_readdir(struct file *filp, void *dirent, filldir_t filldir)
+{
+	struct dir_context ctx = DIR_CONTEXT_INIT(dirent, filldir, filp->f_pos);
+	int error;
+
+	error = zpl_snapdir_iterate(filp, &ctx);
+	filp->f_pos = ctx.pos;
+
+	return (error);
+}
+#endif /* HAVE_VFS_ITERATE */
 
 int
 zpl_snapdir_rename(struct inode *sdip, struct dentry *sdentry,
@@ -300,7 +332,7 @@ zpl_snapdir_rmdir(struct inode *dip, struct dentry *dentry)
 }
 
 static int
-zpl_snapdir_mkdir(struct inode *dip, struct dentry *dentry, int mode)
+zpl_snapdir_mkdir(struct inode *dip, struct dentry *dentry, zpl_umode_t mode)
 {
 	cred_t *cr = CRED();
 	vattr_t *vap;
@@ -308,54 +340,22 @@ zpl_snapdir_mkdir(struct inode *dip, struct dentry *dentry, int mode)
 	int error;
 
 	crhold(cr);
-	vap = kmem_zalloc(sizeof(vattr_t), KM_SLEEP);
-	zpl_vap_init(vap, dip, dentry, mode | S_IFDIR, cr);
+	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+	zpl_vap_init(vap, dip, mode | S_IFDIR, cr);
 
 	error = -zfsctl_snapdir_mkdir(dip, dname(dentry), vap, &ip, cr, 0);
 	if (error == 0) {
-#ifdef HAVE_AUTOMOUNT
-		dentry->d_op = &zpl_dops_snapdirs;
-#endif /* HAVE_AUTOMOUNT */
+		d_clear_d_op(dentry);
+		d_set_d_op(dentry, &zpl_dops_snapdirs);
 		d_instantiate(dentry, ip);
 	}
 
-	kmem_free(vap, sizeof(vattr_t));
+	kmem_free(vap, sizeof (vattr_t));
 	ASSERT3S(error, <=, 0);
 	crfree(cr);
 
 	return (error);
 }
-
-#ifdef HAVE_AUTOMOUNT
-static struct vfsmount *
-zpl_snapdir_automount(struct path *path)
-{
-	struct dentry *dentry = path->dentry;
-	int error;
-
-	/*
-	 * We must briefly disable automounts for this dentry because the
-	 * user space mount utility will trigger another lookup on this
-	 * directory.  That will result in zpl_snapdir_automount() being
-	 * called repeatedly.  The DCACHE_NEED_AUTOMOUNT flag can be
-	 * safely reset once the mount completes.
-	 */
-	dentry->d_flags &= ~DCACHE_NEED_AUTOMOUNT;
-	error = -zfsctl_mount_snapshot(path, 0);
-	dentry->d_flags |= DCACHE_NEED_AUTOMOUNT;
-	if (error)
-		return ERR_PTR(error);
-
-	/*
-	 * Rather than returning the new vfsmount for the snapshot we must
-	 * return NULL to indicate a mount collision.  This is done because
-	 * the user space mount calls do_add_mount() which adds the vfsmount
-	 * to the name space.  If we returned the new mount here it would be
-	 * added again to the vfsmount list resulting in list corruption.
-	 */
-	return (NULL);
-}
-#endif /* HAVE_AUTOMOUNT */
 
 /*
  * Get snapshot directory attributes.
@@ -370,7 +370,7 @@ zpl_snapdir_getattr(struct vfsmount *mnt, struct dentry *dentry,
 
 	ZFS_ENTER(zsb);
 	error = simple_getattr(mnt, dentry, stat);
-	stat->nlink = stat->size = avl_numnodes(&zsb->z_ctldir_snaps) + 2;
+	stat->nlink = stat->size = 2;
 	stat->ctime = stat->mtime = dmu_objset_snap_cmtime(zsb->z_os);
 	stat->atime = CURRENT_TIME;
 	ZFS_EXIT(zsb);
@@ -387,7 +387,14 @@ const struct file_operations zpl_fops_snapdir = {
 	.open		= zpl_common_open,
 	.llseek		= generic_file_llseek,
 	.read		= generic_read_dir,
+#ifdef HAVE_VFS_ITERATE_SHARED
+	.iterate_shared	= zpl_snapdir_iterate,
+#elif defined(HAVE_VFS_ITERATE)
+	.iterate	= zpl_snapdir_iterate,
+#else
 	.readdir	= zpl_snapdir_readdir,
+#endif
+
 };
 
 /*
@@ -403,71 +410,85 @@ const struct inode_operations zpl_ops_snapdir = {
 	.mkdir		= zpl_snapdir_mkdir,
 };
 
-#ifdef HAVE_AUTOMOUNT
-const struct dentry_operations zpl_dops_snapdirs = {
-	.d_automount	= zpl_snapdir_automount,
-};
-#endif /* HAVE_AUTOMOUNT */
-
 static struct dentry *
+#ifdef HAVE_LOOKUP_NAMEIDATA
 zpl_shares_lookup(struct inode *dip, struct dentry *dentry,
     struct nameidata *nd)
+#else
+zpl_shares_lookup(struct inode *dip, struct dentry *dentry,
+    unsigned int flags)
+#endif
 {
+	fstrans_cookie_t cookie;
 	cred_t *cr = CRED();
 	struct inode *ip = NULL;
 	int error;
 
 	crhold(cr);
+	cookie = spl_fstrans_mark();
 	error = -zfsctl_shares_lookup(dip, dname(dentry), &ip,
 	    0, cr, NULL, NULL);
 	ASSERT3S(error, <=, 0);
+	spl_fstrans_unmark(cookie);
 	crfree(cr);
 
 	if (error) {
 		if (error == -ENOENT)
-			return d_splice_alias(NULL, dentry);
+			return (d_splice_alias(NULL, dentry));
 		else
-			return ERR_PTR(error);
+			return (ERR_PTR(error));
 	}
 
-	return d_splice_alias(ip, dentry);
+	return (d_splice_alias(ip, dentry));
 }
 
-/* ARGSUSED */
 static int
-zpl_shares_readdir(struct file *filp, void *dirent, filldir_t filldir)
+zpl_shares_iterate(struct file *filp, struct dir_context *ctx)
 {
+	fstrans_cookie_t cookie;
 	cred_t *cr = CRED();
-	struct dentry *dentry = filp->f_path.dentry;
-	struct inode *ip = dentry->d_inode;
-	zfs_sb_t *zsb = ITOZSB(ip);
+	zfs_sb_t *zsb = ITOZSB(filp->f_path.dentry->d_inode);
 	znode_t *dzp;
-	int error;
+	int error = 0;
 
 	ZFS_ENTER(zsb);
+	cookie = spl_fstrans_mark();
 
 	if (zsb->z_shares_dir == 0) {
-		error = zpl_common_readdir(filp, dirent, filldir);
-		ZFS_EXIT(zsb);
-		return (error);
+		dir_emit_dots(filp, ctx);
+		goto out;
 	}
 
 	error = -zfs_zget(zsb, zsb->z_shares_dir, &dzp);
-	if (error) {
-		ZFS_EXIT(zsb);
-		return (error);
-	}
+	if (error)
+		goto out;
 
 	crhold(cr);
-	error = -zfs_readdir(ZTOI(dzp), dirent, filldir, &filp->f_pos, cr);
+	error = -zfs_readdir(ZTOI(dzp), ctx, cr);
 	crfree(cr);
 
 	iput(ZTOI(dzp));
+out:
+	spl_fstrans_unmark(cookie);
 	ZFS_EXIT(zsb);
 	ASSERT3S(error, <=, 0);
 
 	return (error);
 }
+
+#if !defined(HAVE_VFS_ITERATE) && !defined(HAVE_VFS_ITERATE_SHARED)
+static int
+zpl_shares_readdir(struct file *filp, void *dirent, filldir_t filldir)
+{
+	struct dir_context ctx = DIR_CONTEXT_INIT(dirent, filldir, filp->f_pos);
+	int error;
+
+	error = zpl_shares_iterate(filp, &ctx);
+	filp->f_pos = ctx.pos;
+
+	return (error);
+}
+#endif /* HAVE_VFS_ITERATE */
 
 /* ARGSUSED */
 static int
@@ -490,10 +511,11 @@ zpl_shares_getattr(struct vfsmount *mnt, struct dentry *dentry,
 	}
 
 	error = -zfs_zget(zsb, zsb->z_shares_dir, &dzp);
-	if (error == 0)
-		error = -zfs_getattr_fast(dentry->d_inode, stat);
+	if (error == 0) {
+		error = -zfs_getattr_fast(ZTOI(dzp), stat);
+		iput(ZTOI(dzp));
+	}
 
-	iput(ZTOI(dzp));
 	ZFS_EXIT(zsb);
 	ASSERT3S(error, <=, 0);
 
@@ -507,7 +529,14 @@ const struct file_operations zpl_fops_shares = {
 	.open		= zpl_common_open,
 	.llseek		= generic_file_llseek,
 	.read		= generic_read_dir,
+#ifdef HAVE_VFS_ITERATE_SHARED
+	.iterate_shared	= zpl_shares_iterate,
+#elif defined(HAVE_VFS_ITERATE)
+	.iterate	= zpl_shares_iterate,
+#else
 	.readdir	= zpl_shares_readdir,
+#endif
+
 };
 
 /*

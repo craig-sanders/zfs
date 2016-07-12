@@ -4,11 +4,15 @@ dnl #
 AC_DEFUN([ZFS_AC_KERNEL_FSYNC_WITH_DENTRY], [
 	ZFS_LINUX_TRY_COMPILE([
 		#include <linux/fs.h>
-	],[
-		int (*fsync) (struct file *, struct dentry *, int) = NULL;
-		struct file_operations fops __attribute__ ((unused));
 
-		fops.fsync = fsync;
+		int test_fsync(struct file *f, struct dentry *dentry, int x)
+		    { return 0; }
+
+		static const struct file_operations
+		    fops __attribute__ ((unused)) = {
+			.fsync = test_fsync,
+		};
+	],[
 	],[
 		AC_MSG_RESULT([dentry])
 		AC_DEFINE(HAVE_FSYNC_WITH_DENTRY, 1,
@@ -23,11 +27,14 @@ dnl #
 AC_DEFUN([ZFS_AC_KERNEL_FSYNC_WITHOUT_DENTRY], [
 	ZFS_LINUX_TRY_COMPILE([
 		#include <linux/fs.h>
-	],[
-		int (*fsync) (struct file *, int) = NULL;
-		struct file_operations fops __attribute__ ((unused));
 
-		fops.fsync = fsync;
+		int test_fsync(struct file *f, int x) { return 0; }
+
+		static const struct file_operations
+		    fops __attribute__ ((unused)) = {
+			.fsync = test_fsync,
+		};
+	],[
 	],[
 		AC_MSG_RESULT([no dentry])
 		AC_DEFINE(HAVE_FSYNC_WITHOUT_DENTRY, 1,
@@ -37,16 +44,20 @@ AC_DEFUN([ZFS_AC_KERNEL_FSYNC_WITHOUT_DENTRY], [
 ])
 
 dnl #
-dnl # Linux 3.1 -x 3.x API
+dnl # Linux 3.1 - 3.x API
 dnl #
 AC_DEFUN([ZFS_AC_KERNEL_FSYNC_RANGE], [
 	ZFS_LINUX_TRY_COMPILE([
 		#include <linux/fs.h>
-	],[
-		int (*fsync) (struct file *, loff_t, loff_t, int) = NULL;
-		struct file_operations fops __attribute__ ((unused));
 
-		fops.fsync = fsync;
+		int test_fsync(struct file *f, loff_t a, loff_t b, int c)
+		    { return 0; }
+
+		static const struct file_operations
+		    fops __attribute__ ((unused)) = {
+			.fsync = test_fsync,
+		};
+	],[
 	],[
 		AC_MSG_RESULT([range])
 		AC_DEFINE(HAVE_FSYNC_RANGE, 1,

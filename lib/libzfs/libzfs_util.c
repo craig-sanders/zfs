@@ -18,8 +18,11 @@
  *
  * CDDL HEADER END
  */
+
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, Joyent, Inc. All rights reserved.
+ * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
  */
 
 /*
@@ -43,14 +46,41 @@
 #include <wait.h>
 
 #include <libzfs.h>
+#include <libzfs_core.h>
 
 #include "libzfs_impl.h"
 #include "zfs_prop.h"
+#include "zfeature_common.h"
 
 int
 libzfs_errno(libzfs_handle_t *hdl)
 {
 	return (hdl->libzfs_error);
+}
+
+const char *
+libzfs_error_init(int error)
+{
+	switch (error) {
+	case ENXIO:
+		return (dgettext(TEXT_DOMAIN, "The ZFS modules are not "
+		    "loaded.\nTry running '/sbin/modprobe zfs' as root "
+		    "to load them.\n"));
+	case ENOENT:
+		return (dgettext(TEXT_DOMAIN, "The /dev/zfs device is "
+		    "missing and must be created.\nTry running 'udevadm "
+		    "trigger' as root to create it.\n"));
+	case ENOEXEC:
+		return (dgettext(TEXT_DOMAIN, "The ZFS modules cannot be "
+		    "auto-loaded.\nTry running '/sbin/modprobe zfs' as "
+		    "root to manually load them.\n"));
+	case EACCES:
+		return (dgettext(TEXT_DOMAIN, "Permission denied the "
+		    "ZFS utilities must be run as root.\n"));
+	default:
+		return (dgettext(TEXT_DOMAIN, "Failed to initialize the "
+		    "libzfs library.\n"));
+	}
 }
 
 const char *
@@ -113,7 +143,8 @@ libzfs_error_description(libzfs_handle_t *hdl)
 	case EZFS_RESILVERING:
 		return (dgettext(TEXT_DOMAIN, "currently resilvering"));
 	case EZFS_BADVERSION:
-		return (dgettext(TEXT_DOMAIN, "unsupported version"));
+		return (dgettext(TEXT_DOMAIN, "unsupported version or "
+		    "feature"));
 	case EZFS_POOLUNAVAIL:
 		return (dgettext(TEXT_DOMAIN, "pool is unavailable"));
 	case EZFS_DEVOVERFLOW:
@@ -346,6 +377,7 @@ zfs_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	switch (error) {
 	case ENXIO:
 	case ENODEV:
+	case EPIPE:
 		zfs_verror(hdl, EZFS_IO, fmt, ap);
 		break;
 
@@ -468,6 +500,11 @@ zpool_standard_error_fmt(libzfs_handle_t *hdl, int error, const char *fmt, ...)
 	case EROFS:
 		zfs_verror(hdl, EZFS_POOLREADONLY, fmt, ap);
 		break;
+	case EDOM:
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "block size out of range or does not match"));
+		zfs_verror(hdl, EZFS_BADPROP, fmt, ap);
+		break;
 
 	default:
 		zfs_error_aux(hdl, strerror(error));
@@ -559,27 +596,49 @@ zfs_strdup(libzfs_handle_t *hdl, const char *str)
  * Convert a number to an appropriately human-readable output.
  */
 void
-zfs_nicenum(uint64_t num, char *buf, size_t buflen)
+zfs_nicenum_format(uint64_t num, char *buf, size_t buflen,
+    enum zfs_nicenum_format format)
 {
 	uint64_t n = num;
 	int index = 0;
-	char u;
+	const char *u;
+	const char *units[3][7] = {
+	    [ZFS_NICENUM_1024] = {"", "K", "M", "G", "T", "P", "E"},
+	    [ZFS_NICENUM_TIME] = {"ns", "us", "ms", "s", "?", "?", "?"}
+	};
 
-	while (n >= 1024) {
-		n /= 1024;
+	const int units_len[] = {[ZFS_NICENUM_1024] = 6,
+	    [ZFS_NICENUM_TIME] = 4};
+
+	const int k_unit[] = {	[ZFS_NICENUM_1024] = 1024,
+	    [ZFS_NICENUM_TIME] = 1000};
+
+	double val;
+
+	if (format == ZFS_NICENUM_RAW) {
+		snprintf(buf, buflen, "%llu", (u_longlong_t) num);
+		return;
+	}
+
+
+	while (n >= k_unit[format] && index < units_len[format]) {
+		n /= k_unit[format];
 		index++;
 	}
 
-	u = " KMGTPE"[index];
+	u = units[format][index];
 
-	if (index == 0) {
-		(void) snprintf(buf, buflen, "%llu", (u_longlong_t) n);
-	} else if ((num & ((1ULL << 10 * index) - 1)) == 0) {
+	/* Don't print 0ns times */
+	if ((format == ZFS_NICENUM_TIME) && (num == 0)) {
+		(void) snprintf(buf, buflen, "-");
+	} else if ((index == 0) || ((num %
+	    (uint64_t) powl(k_unit[format], index)) == 0)) {
 		/*
 		 * If this is an even multiple of the base, always display
 		 * without any decimal precision.
 		 */
-		(void) snprintf(buf, buflen, "%llu%c", (u_longlong_t) n, u);
+		(void) snprintf(buf, buflen, "%llu%s", (u_longlong_t) n, u);
+
 	} else {
 		/*
 		 * We want to choose a precision that reflects the best choice
@@ -592,12 +651,60 @@ zfs_nicenum(uint64_t num, char *buf, size_t buflen)
 		 */
 		int i;
 		for (i = 2; i >= 0; i--) {
-			if (snprintf(buf, buflen, "%.*f%c", i,
-			    (double)num / (1ULL << 10 * index), u) <= 5)
-				break;
+			val = (double) num /
+			    (uint64_t) powl(k_unit[format], index);
+
+			/*
+			 * Don't print floating point values for time.  Note,
+			 * we use floor() instead of round() here, since
+			 * round can result in undesirable results.  For
+			 * example, if "num" is in the range of
+			 * 999500-999999, it will print out "1000us".  This
+			 * doesn't happen if we use floor().
+			 */
+			if (format == ZFS_NICENUM_TIME) {
+				if (snprintf(buf, buflen, "%d%s",
+				    (unsigned int) floor(val), u) <= 5)
+					break;
+
+			} else {
+				if (snprintf(buf, buflen, "%.*f%s", i,
+				    val, u) <= 5)
+					break;
+			}
 		}
 	}
 }
+
+/*
+ * Convert a number to an appropriately human-readable output.
+ */
+void
+zfs_nicenum(uint64_t num, char *buf, size_t buflen)
+{
+	zfs_nicenum_format(num, buf, buflen, ZFS_NICENUM_1024);
+}
+
+/*
+ * Convert a time to an appropriately human-readable output.
+ * @num:	Time in nanoseconds
+ */
+void
+zfs_nicetime(uint64_t num, char *buf, size_t buflen)
+{
+	zfs_nicenum_format(num, buf, buflen, ZFS_NICENUM_TIME);
+}
+
+/*
+ * Print out a raw number with correct column spacing
+ */
+void
+zfs_niceraw(uint64_t num, char *buf, size_t buflen)
+{
+	zfs_nicenum_format(num, buf, buflen, ZFS_NICENUM_RAW);
+}
+
+
 
 void
 libzfs_print_on_error(libzfs_handle_t *hdl, boolean_t printerr)
@@ -608,34 +715,20 @@ libzfs_print_on_error(libzfs_handle_t *hdl, boolean_t printerr)
 static int
 libzfs_module_loaded(const char *module)
 {
-	FILE *f;
-	int result = 0;
-	char name[256];
+	const char path_prefix[] = "/sys/module/";
+	char path[256];
 
-	f = fopen("/proc/modules", "r");
-	if (f == NULL)
-		return -1;
+	memcpy(path, path_prefix, sizeof (path_prefix) - 1);
+	strcpy(path + sizeof (path_prefix) - 1, module);
 
-	while (fgets(name, sizeof(name), f)) {
-		char *c = strchr(name, ' ');
-		if (!c)
-			continue;
-		*c = 0;
-		if (strcmp(module, name) == 0) {
-			result = 1;
-			break;
-		}
-	}
-	fclose(f);
-
-	return result;
+	return (access(path, F_OK) == 0);
 }
 
 int
 libzfs_run_process(const char *path, char *argv[], int flags)
 {
 	pid_t pid;
-	int rc, devnull_fd;
+	int error, devnull_fd;
 
 	pid = vfork();
 	if (pid == 0) {
@@ -657,37 +750,96 @@ libzfs_run_process(const char *path, char *argv[], int flags)
 	} else if (pid > 0) {
 		int status;
 
-		while ((rc = waitpid(pid, &status, 0)) == -1 &&
+		while ((error = waitpid(pid, &status, 0)) == -1 &&
 			errno == EINTR);
-		if (rc < 0 || !WIFEXITED(status))
-			return -1;
+		if (error < 0 || !WIFEXITED(status))
+			return (-1);
 
-		return WEXITSTATUS(status);
+		return (WEXITSTATUS(status));
 	}
 
-	return -1;
+	return (-1);
 }
 
-int
+/*
+ * Verify the required ZFS_DEV device is available and optionally attempt
+ * to load the ZFS modules.  Under normal circumstances the modules
+ * should already have been loaded by some external mechanism.
+ *
+ * Environment variables:
+ * - ZFS_MODULE_LOADING="YES|yes|ON|on" - Attempt to load modules.
+ * - ZFS_MODULE_TIMEOUT="<seconds>"     - Seconds to wait for ZFS_DEV
+ */
+static int
 libzfs_load_module(const char *module)
 {
 	char *argv[4] = {"/sbin/modprobe", "-q", (char *)module, (char *)0};
+	char *load_str, *timeout_str;
+	long timeout = 10; /* seconds */
+	long busy_timeout = 10; /* milliseconds */
+	int load = 0, fd;
+	hrtime_t start;
 
-	if (libzfs_module_loaded(module))
-		return 0;
+	/* Optionally request module loading */
+	if (!libzfs_module_loaded(module)) {
+		load_str = getenv("ZFS_MODULE_LOADING");
+		if (load_str) {
+			if (!strncasecmp(load_str, "YES", strlen("YES")) ||
+			    !strncasecmp(load_str, "ON", strlen("ON")))
+				load = 1;
+			else
+				load = 0;
+		}
 
-	return libzfs_run_process("/sbin/modprobe", argv, 0);
+		if (load && libzfs_run_process("/sbin/modprobe", argv, 0))
+			return (ENOEXEC);
+	}
+
+	/* Module loading is synchronous it must be available */
+	if (!libzfs_module_loaded(module))
+		return (ENXIO);
+
+	/*
+	 * Device creation by udev is asynchronous and waiting may be
+	 * required.  Busy wait for 10ms and then fall back to polling every
+	 * 10ms for the allowed timeout (default 10s, max 10m).  This is
+	 * done to optimize for the common case where the device is
+	 * immediately available and to avoid penalizing the possible
+	 * case where udev is slow or unable to create the device.
+	 */
+	timeout_str = getenv("ZFS_MODULE_TIMEOUT");
+	if (timeout_str) {
+		timeout = strtol(timeout_str, NULL, 0);
+		timeout = MAX(MIN(timeout, (10 * 60)), 0); /* 0 <= N <= 600 */
+	}
+
+	start = gethrtime();
+	do {
+		fd = open(ZFS_DEV, O_RDWR);
+		if (fd >= 0) {
+			(void) close(fd);
+			return (0);
+		} else if (errno != ENOENT) {
+			return (errno);
+		} else if (NSEC2MSEC(gethrtime() - start) < busy_timeout) {
+			sched_yield();
+		} else {
+			usleep(10 * MILLISEC);
+		}
+	} while (NSEC2MSEC(gethrtime() - start) < (timeout * MILLISEC));
+
+	return (ENOENT);
 }
 
 libzfs_handle_t *
 libzfs_init(void)
 {
 	libzfs_handle_t *hdl;
+	int error;
 
-	if (libzfs_load_module("zfs") != 0) {
-		(void) fprintf(stderr, gettext("Failed to load ZFS module "
-			       "stack.\nLoad the module manually by running "
-			       "'insmod <location>/zfs.ko' as root.\n"));
+	error = libzfs_load_module(ZFS_DRIVER);
+	if (error) {
+		errno = error;
 		return (NULL);
 	}
 
@@ -696,13 +848,6 @@ libzfs_init(void)
 	}
 
 	if ((hdl->libzfs_fd = open(ZFS_DEV, O_RDWR)) < 0) {
-		(void) fprintf(stderr, gettext("Unable to open %s: %s.\n"),
-			       ZFS_DEV, strerror(errno));
-		if (errno == ENOENT)
-			(void) fprintf(stderr,
-			     gettext("Verify the ZFS module stack is "
-			     "loaded by running '/sbin/modprobe zfs'.\n"));
-
 		free(hdl);
 		return (NULL);
 	}
@@ -719,8 +864,17 @@ libzfs_init(void)
 
 	hdl->libzfs_sharetab = fopen("/etc/dfs/sharetab", "r");
 
+	if (libzfs_core_init() != 0) {
+		(void) close(hdl->libzfs_fd);
+		(void) fclose(hdl->libzfs_mnttab);
+		(void) fclose(hdl->libzfs_sharetab);
+		free(hdl);
+		return (NULL);
+	}
+
 	zfs_prop_init();
 	zpool_prop_init();
+	zpool_feature_init();
 	libzfs_mnttab_init(hdl);
 
 	return (hdl);
@@ -739,12 +893,11 @@ libzfs_fini(libzfs_handle_t *hdl)
 	if (hdl->libzfs_sharetab)
 		(void) fclose(hdl->libzfs_sharetab);
 	zfs_uninit_libshare(hdl);
-	if (hdl->libzfs_log_str)
-		(void) free(hdl->libzfs_log_str);
 	zpool_free_handles(hdl);
 	libzfs_fru_clear(hdl, B_TRUE);
 	namespace_clear(hdl);
 	libzfs_mnttab_fini(hdl);
+	libzfs_core_fini();
 	free(hdl);
 }
 
@@ -791,7 +944,10 @@ zfs_path_to_zhandle(libzfs_handle_t *hdl, char *path, zfs_type_t argtype)
 		return (NULL);
 	}
 
-	rewind(hdl->libzfs_mnttab);
+	/* Reopen MNTTAB to prevent reading stale data from open file */
+	if (freopen(MNTTAB, "r", hdl->libzfs_mnttab) == NULL)
+		return (NULL);
+
 	while ((ret = getextmntent(hdl->libzfs_mnttab, &entry, 0)) == 0) {
 		if (makedevice(entry.mnt_major, entry.mnt_minor) ==
 		    statbuf.st_dev) {
@@ -812,43 +968,168 @@ zfs_path_to_zhandle(libzfs_handle_t *hdl, char *path, zfs_type_t argtype)
 }
 
 /*
- * Given a shorthand device name, check if a file by that name exists in a list
- * of directories under /dev.  If one is found, store its full path in the
- * buffer pointed to by the path argument and return 0, else return -1.  The
- * path buffer must be allocated by the caller.
+ * Append partition suffix to an otherwise fully qualified device path.
+ * This is used to generate the name the full path as its stored in
+ * ZPOOL_CONFIG_PATH for whole disk devices.  On success the new length
+ * of 'path' will be returned on error a negative value is returned.
  */
 int
-zfs_resolve_shortname(const char *name, char *path, size_t pathlen)
+zfs_append_partition(char *path, size_t max_len)
 {
-	int i, err;
-	char dirs[5][9] = {"by-id", "by-label", "by-path", "by-uuid", "zpool"};
+	int len = strlen(path);
 
-	(void) snprintf(path, pathlen, "%s/%s", DISK_ROOT, name);
-	err = access(path, F_OK);
-	for (i = 0; i < 5 && err < 0; i++) {
-		(void) snprintf(path, pathlen, "%s/%s/%s",
-		    UDISK_ROOT, dirs[i], name);
-		err = access(path, F_OK);
+	if ((strncmp(path, UDISK_ROOT, strlen(UDISK_ROOT)) == 0) ||
+	    (strncmp(path, ZVOL_ROOT, strlen(ZVOL_ROOT)) == 0)) {
+		if (len + 6 >= max_len)
+			return (-1);
+
+		(void) strcat(path, "-part1");
+		len += 6;
+	} else {
+		if (len + 2 >= max_len)
+			return (-1);
+
+		if (isdigit(path[len-1])) {
+			(void) strcat(path, "p1");
+			len += 2;
+		} else {
+			(void) strcat(path, "1");
+			len += 1;
+		}
 	}
-	return err;
+
+	return (len);
 }
 
 /*
- * Append partition suffix to a device path.  This should be used to generate
- * the name of a whole disk as it is stored in the vdev label.  The
- * user-visible names of whole disks do not contain the partition information.
- * Modifies buf which must be allocated by the caller.
+ * Given a shorthand device name check if a file by that name exists in any
+ * of the 'zpool_default_import_path' or ZPOOL_IMPORT_PATH directories.  If
+ * one is found, store its fully qualified path in the 'path' buffer passed
+ * by the caller and return 0, otherwise return an error.
  */
-void
-zfs_append_partition(const char *path, char *buf, size_t buflen)
+int
+zfs_resolve_shortname(const char *name, char *path, size_t len)
 {
-	if (strncmp(path, UDISK_ROOT, strlen(UDISK_ROOT)) == 0)
-		(void) snprintf(buf, buflen, "%s%s%s", path, "-part",
-			FIRST_SLICE);
-	else
-		(void) snprintf(buf, buflen, "%s%s%s", path,
-			isdigit(path[strlen(path)-1]) ?  "p" : "",
-			FIRST_SLICE);
+	int i, error = -1;
+	char *dir, *env, *envdup;
+
+	env = getenv("ZPOOL_IMPORT_PATH");
+	errno = ENOENT;
+
+	if (env) {
+		envdup = strdup(env);
+		dir = strtok(envdup, ":");
+		while (dir && error) {
+			(void) snprintf(path, len, "%s/%s", dir, name);
+			error = access(path, F_OK);
+			dir = strtok(NULL, ":");
+		}
+		free(envdup);
+	} else {
+		for (i = 0; i < DEFAULT_IMPORT_PATH_SIZE && error < 0; i++) {
+			(void) snprintf(path, len, "%s/%s",
+			    zpool_default_import_path[i], name);
+			error = access(path, F_OK);
+		}
+	}
+
+	return (error ? ENOENT : 0);
+}
+
+/*
+ * Given a shorthand device name look for a match against 'cmp_name'.  This
+ * is done by checking all prefix expansions using either the default
+ * 'zpool_default_import_paths' or the ZPOOL_IMPORT_PATH environment
+ * variable.  Proper partition suffixes will be appended if this is a
+ * whole disk.  When a match is found 0 is returned otherwise ENOENT.
+ */
+static int
+zfs_strcmp_shortname(char *name, char *cmp_name, int wholedisk)
+{
+	int path_len, cmp_len, i = 0, error = ENOENT;
+	char *dir, *env, *envdup = NULL;
+	char path_name[MAXPATHLEN];
+
+	cmp_len = strlen(cmp_name);
+	env = getenv("ZPOOL_IMPORT_PATH");
+
+	if (env) {
+		envdup = strdup(env);
+		dir = strtok(envdup, ":");
+	} else {
+		dir =  zpool_default_import_path[i];
+	}
+
+	while (dir) {
+		/* Trim trailing directory slashes from ZPOOL_IMPORT_PATH */
+		while (dir[strlen(dir)-1] == '/')
+			dir[strlen(dir)-1] = '\0';
+
+		path_len = snprintf(path_name, MAXPATHLEN, "%s/%s", dir, name);
+		if (wholedisk)
+			path_len = zfs_append_partition(path_name, MAXPATHLEN);
+
+		if ((path_len == cmp_len) && strcmp(path_name, cmp_name) == 0) {
+			error = 0;
+			break;
+		}
+
+		if (env) {
+			dir = strtok(NULL, ":");
+		} else if (++i < DEFAULT_IMPORT_PATH_SIZE) {
+			dir = zpool_default_import_path[i];
+		} else {
+			dir = NULL;
+		}
+	}
+
+	if (env)
+		free(envdup);
+
+	return (error);
+}
+
+/*
+ * Given either a shorthand or fully qualified path name look for a match
+ * against 'cmp'.  The passed name will be expanded as needed for comparison
+ * purposes and redundant slashes stripped to ensure an accurate match.
+ */
+int
+zfs_strcmp_pathname(char *name, char *cmp, int wholedisk)
+{
+	int path_len, cmp_len;
+	char path_name[MAXPATHLEN];
+	char cmp_name[MAXPATHLEN];
+	char *dir, *dup;
+
+	/* Strip redundant slashes if one exists due to ZPOOL_IMPORT_PATH */
+	memset(cmp_name, 0, MAXPATHLEN);
+	dup = strdup(cmp);
+	dir = strtok(dup, "/");
+	while (dir) {
+		strcat(cmp_name, "/");
+		strcat(cmp_name, dir);
+		dir = strtok(NULL, "/");
+	}
+	free(dup);
+
+	if (name[0] != '/')
+		return (zfs_strcmp_shortname(name, cmp_name, wholedisk));
+
+	(void) strlcpy(path_name, name, MAXPATHLEN);
+	path_len = strlen(path_name);
+	cmp_len = strlen(cmp_name);
+
+	if (wholedisk) {
+		path_len = zfs_append_partition(path_name, MAXPATHLEN);
+		if (path_len == -1)
+			return (ENOMEM);
+	}
+
+	if ((path_len != cmp_len) || strcmp(path_name, cmp_name))
+		return (ENOENT);
+
+	return (0);
 }
 
 /*
@@ -861,8 +1142,9 @@ zcmd_alloc_dst_nvlist(libzfs_handle_t *hdl, zfs_cmd_t *zc, size_t len)
 	if (len == 0)
 		len = 16 * 1024;
 	zc->zc_nvlist_dst_size = len;
-	if ((zc->zc_nvlist_dst = (uint64_t)(uintptr_t)
-	    zfs_alloc(hdl, zc->zc_nvlist_dst_size)) == 0)
+	zc->zc_nvlist_dst =
+	    (uint64_t)(uintptr_t)zfs_alloc(hdl, zc->zc_nvlist_dst_size);
+	if (zc->zc_nvlist_dst == 0)
 		return (-1);
 
 	return (0);
@@ -877,8 +1159,9 @@ int
 zcmd_expand_dst_nvlist(libzfs_handle_t *hdl, zfs_cmd_t *zc)
 {
 	free((void *)(uintptr_t)zc->zc_nvlist_dst);
-	if ((zc->zc_nvlist_dst = (uint64_t)(uintptr_t)
-	    zfs_alloc(hdl, zc->zc_nvlist_dst_size)) == 0)
+	zc->zc_nvlist_dst =
+	    (uint64_t)(uintptr_t)zfs_alloc(hdl, zc->zc_nvlist_dst_size);
+	if (zc->zc_nvlist_dst == 0)
 		return (-1);
 
 	return (0);
@@ -893,6 +1176,9 @@ zcmd_free_nvlists(zfs_cmd_t *zc)
 	free((void *)(uintptr_t)zc->zc_nvlist_conf);
 	free((void *)(uintptr_t)zc->zc_nvlist_src);
 	free((void *)(uintptr_t)zc->zc_nvlist_dst);
+	zc->zc_nvlist_conf = 0;
+	zc->zc_nvlist_src = 0;
+	zc->zc_nvlist_dst = 0;
 }
 
 static int
@@ -945,17 +1231,7 @@ zcmd_read_dst_nvlist(libzfs_handle_t *hdl, zfs_cmd_t *zc, nvlist_t **nvlp)
 int
 zfs_ioctl(libzfs_handle_t *hdl, int request, zfs_cmd_t *zc)
 {
-	int error;
-
-	zc->zc_history = (uint64_t)(uintptr_t)hdl->libzfs_log_str;
-	error = ioctl(hdl->libzfs_fd, request, zc);
-	if (hdl->libzfs_log_str) {
-		free(hdl->libzfs_log_str);
-		hdl->libzfs_log_str = NULL;
-	}
-	zc->zc_history = 0;
-
-	return (error);
+	return (ioctl(hdl->libzfs_fd, request, zc));
 }
 
 /*
@@ -1187,8 +1463,9 @@ str2shift(libzfs_handle_t *hdl, const char *buf)
 			break;
 	}
 	if (i == strlen(ends)) {
-		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-		    "invalid numeric suffix '%s'"), buf);
+		if (hdl)
+			zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+			    "invalid numeric suffix '%s'"), buf);
 		return (-1);
 	}
 
@@ -1198,13 +1475,14 @@ str2shift(libzfs_handle_t *hdl, const char *buf)
 	 */
 	if (buf[1] == '\0' ||
 	    (toupper(buf[0]) != 'B' &&
-	     ((toupper(buf[1]) == 'B' && buf[2] == '\0') ||
-	      (toupper(buf[1]) == 'I' && toupper(buf[2]) == 'B' &&
-	       buf[3] == '\0'))))
-		return (10*i);
+	    ((toupper(buf[1]) == 'B' && buf[2] == '\0') ||
+	    (toupper(buf[1]) == 'I' && toupper(buf[2]) == 'B' &&
+	    buf[3] == '\0'))))
+		return (10 * i);
 
-	zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
-	    "invalid numeric suffix '%s'"), buf);
+	if (hdl)
+		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
+		    "invalid numeric suffix '%s'"), buf);
 	return (-1);
 }
 
@@ -1359,6 +1637,16 @@ zprop_parse_value(libzfs_handle_t *hdl, nvpair_t *elem, int prop,
 			    "use 'none' to disable quota/refquota"));
 			goto error;
 		}
+
+		/*
+		 * Special handling for "*_limit=none". In this case it's not
+		 * 0 but UINT64_MAX.
+		 */
+		if ((type & ZFS_TYPE_DATASET) && isnone &&
+		    (prop == ZFS_PROP_FILESYSTEM_LIMIT ||
+		    prop == ZFS_PROP_SNAPSHOT_LIMIT)) {
+			*ivalp = UINT64_MAX;
+		}
 		break;
 
 	case PROP_TYPE_INDEX:
@@ -1412,7 +1700,7 @@ addlist(libzfs_handle_t *hdl, char *propname, zprop_list_t **listp,
 
 	prop = zprop_name_to_prop(propname, type);
 
-	if (prop != ZPROP_INVAL && !zprop_valid_for_type(prop, type))
+	if (prop != ZPROP_INVAL && !zprop_valid_for_type(prop, type, B_FALSE))
 		prop = ZPROP_INVAL;
 
 	/*
@@ -1420,8 +1708,11 @@ addlist(libzfs_handle_t *hdl, char *propname, zprop_list_t **listp,
 	 * this is a pool property or if this isn't a user-defined
 	 * dataset property,
 	 */
-	if (prop == ZPROP_INVAL && (type == ZFS_TYPE_POOL ||
-	    (!zfs_prop_user(propname) && !zfs_prop_userquota(propname)))) {
+	if (prop == ZPROP_INVAL && ((type == ZFS_TYPE_POOL &&
+	    !zpool_prop_feature(propname) &&
+	    !zpool_prop_unsupported(propname)) ||
+	    (type == ZFS_TYPE_DATASET && !zfs_prop_user(propname) &&
+	    !zfs_prop_userquota(propname) && !zfs_prop_written(propname)))) {
 		zfs_error_aux(hdl, dgettext(TEXT_DOMAIN,
 		    "invalid property '%s'"), propname);
 		return (zfs_error(hdl, EZFS_BADPROP,
@@ -1433,7 +1724,8 @@ addlist(libzfs_handle_t *hdl, char *propname, zprop_list_t **listp,
 
 	entry->pl_prop = prop;
 	if (prop == ZPROP_INVAL) {
-		if ((entry->pl_user_prop = zfs_strdup(hdl, propname)) == NULL) {
+		if ((entry->pl_user_prop = zfs_strdup(hdl, propname)) ==
+		    NULL) {
 			free(entry);
 			return (-1);
 		}

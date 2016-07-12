@@ -21,6 +21,8 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013 by Delphix. All rights reserved.
+ * Copyright (c) 2016 Intel Corporation.
  */
 
 /*
@@ -67,6 +69,8 @@
 #include <libintl.h>
 #include <libnvpair.h>
 #include <limits.h>
+#include <scsi/scsi.h>
+#include <scsi/sg.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -75,13 +79,9 @@
 #include <sys/vtoc.h>
 #include <sys/mntent.h>
 #include <uuid/uuid.h>
-#ifdef HAVE_LIBBLKID
 #include <blkid/blkid.h>
-#else
-#define blkid_cache void *
-#endif /* HAVE_LIBBLKID */
-
 #include "zpool_util.h"
+#include <sys/zfs_context.h>
 
 /*
  * For any given vdev specification, we can have multiple errors.  The
@@ -90,6 +90,187 @@
  */
 boolean_t error_seen;
 boolean_t is_force;
+
+typedef struct vdev_disk_db_entry
+{
+	char id[24];
+	int sector_size;
+} vdev_disk_db_entry_t;
+
+/*
+ * Database of block devices that lie about physical sector sizes.  The
+ * identification string must be precisely 24 characters to avoid false
+ * negatives
+ */
+static vdev_disk_db_entry_t vdev_disk_database[] = {
+	{"ATA     ADATA SSD S396 3", 8192},
+	{"ATA     APPLE SSD SM128E", 8192},
+	{"ATA     APPLE SSD SM256E", 8192},
+	{"ATA     APPLE SSD SM512E", 8192},
+	{"ATA     APPLE SSD SM768E", 8192},
+	{"ATA     C400-MTFDDAC064M", 8192},
+	{"ATA     C400-MTFDDAC128M", 8192},
+	{"ATA     C400-MTFDDAC256M", 8192},
+	{"ATA     C400-MTFDDAC512M", 8192},
+	{"ATA     Corsair Force 3 ", 8192},
+	{"ATA     Corsair Force GS", 8192},
+	{"ATA     INTEL SSDSA2CT04", 8192},
+	{"ATA     INTEL SSDSA2BZ10", 8192},
+	{"ATA     INTEL SSDSA2BZ20", 8192},
+	{"ATA     INTEL SSDSA2BZ30", 8192},
+	{"ATA     INTEL SSDSA2CW04", 8192},
+	{"ATA     INTEL SSDSA2CW08", 8192},
+	{"ATA     INTEL SSDSA2CW12", 8192},
+	{"ATA     INTEL SSDSA2CW16", 8192},
+	{"ATA     INTEL SSDSA2CW30", 8192},
+	{"ATA     INTEL SSDSA2CW60", 8192},
+	{"ATA     INTEL SSDSC2CT06", 8192},
+	{"ATA     INTEL SSDSC2CT12", 8192},
+	{"ATA     INTEL SSDSC2CT18", 8192},
+	{"ATA     INTEL SSDSC2CT24", 8192},
+	{"ATA     INTEL SSDSC2CW06", 8192},
+	{"ATA     INTEL SSDSC2CW12", 8192},
+	{"ATA     INTEL SSDSC2CW18", 8192},
+	{"ATA     INTEL SSDSC2CW24", 8192},
+	{"ATA     INTEL SSDSC2CW48", 8192},
+	{"ATA     KINGSTON SH100S3", 8192},
+	{"ATA     KINGSTON SH103S3", 8192},
+	{"ATA     M4-CT064M4SSD2  ", 8192},
+	{"ATA     M4-CT128M4SSD2  ", 8192},
+	{"ATA     M4-CT256M4SSD2  ", 8192},
+	{"ATA     M4-CT512M4SSD2  ", 8192},
+	{"ATA     OCZ-AGILITY2    ", 8192},
+	{"ATA     OCZ-AGILITY3    ", 8192},
+	{"ATA     OCZ-VERTEX2 3.5 ", 8192},
+	{"ATA     OCZ-VERTEX3     ", 8192},
+	{"ATA     OCZ-VERTEX3 LT  ", 8192},
+	{"ATA     OCZ-VERTEX3 MI  ", 8192},
+	{"ATA     OCZ-VERTEX4     ", 8192},
+	{"ATA     SAMSUNG MZ7WD120", 8192},
+	{"ATA     SAMSUNG MZ7WD240", 8192},
+	{"ATA     SAMSUNG MZ7WD480", 8192},
+	{"ATA     SAMSUNG MZ7WD960", 8192},
+	{"ATA     SAMSUNG SSD 830 ", 8192},
+	{"ATA     Samsung SSD 840 ", 8192},
+	{"ATA     SanDisk SSD U100", 8192},
+	{"ATA     TOSHIBA THNSNH06", 8192},
+	{"ATA     TOSHIBA THNSNH12", 8192},
+	{"ATA     TOSHIBA THNSNH25", 8192},
+	{"ATA     TOSHIBA THNSNH51", 8192},
+	{"ATA     APPLE SSD TS064C", 4096},
+	{"ATA     APPLE SSD TS128C", 4096},
+	{"ATA     APPLE SSD TS256C", 4096},
+	{"ATA     APPLE SSD TS512C", 4096},
+	{"ATA     INTEL SSDSA2M040", 4096},
+	{"ATA     INTEL SSDSA2M080", 4096},
+	{"ATA     INTEL SSDSA2M160", 4096},
+	{"ATA     INTEL SSDSC2MH12", 4096},
+	{"ATA     INTEL SSDSC2MH25", 4096},
+	{"ATA     OCZ CORE_SSD    ", 4096},
+	{"ATA     OCZ-VERTEX      ", 4096},
+	{"ATA     SAMSUNG MCCOE32G", 4096},
+	{"ATA     SAMSUNG MCCOE64G", 4096},
+	{"ATA     SAMSUNG SSD PM80", 4096},
+	/* Flash drives optimized for 4KB IOs on larger pages */
+	{"ATA     INTEL SSDSC2BA10", 4096},
+	{"ATA     INTEL SSDSC2BA20", 4096},
+	{"ATA     INTEL SSDSC2BA40", 4096},
+	{"ATA     INTEL SSDSC2BA80", 4096},
+	{"ATA     INTEL SSDSC2BB08", 4096},
+	{"ATA     INTEL SSDSC2BB12", 4096},
+	{"ATA     INTEL SSDSC2BB16", 4096},
+	{"ATA     INTEL SSDSC2BB24", 4096},
+	{"ATA     INTEL SSDSC2BB30", 4096},
+	{"ATA     INTEL SSDSC2BB40", 4096},
+	{"ATA     INTEL SSDSC2BB48", 4096},
+	{"ATA     INTEL SSDSC2BB60", 4096},
+	{"ATA     INTEL SSDSC2BB80", 4096},
+	{"ATA     INTEL SSDSC2BW24", 4096},
+	{"ATA     INTEL SSDSC2BP24", 4096},
+	{"ATA     INTEL SSDSC2BP48", 4096},
+	{"NA      SmrtStorSDLKAE9W", 4096},
+	/* Imported from Open Solaris */
+	{"ATA     MARVELL SD88SA02", 4096},
+	/* Advanced format Hard drives */
+	{"ATA     Hitachi HDS5C303", 4096},
+	{"ATA     SAMSUNG HD204UI ", 4096},
+	{"ATA     ST2000DL004 HD20", 4096},
+	{"ATA     WDC WD10EARS-00M", 4096},
+	{"ATA     WDC WD10EARS-00S", 4096},
+	{"ATA     WDC WD10EARS-00Z", 4096},
+	{"ATA     WDC WD15EARS-00M", 4096},
+	{"ATA     WDC WD15EARS-00S", 4096},
+	{"ATA     WDC WD15EARS-00Z", 4096},
+	{"ATA     WDC WD20EARS-00M", 4096},
+	{"ATA     WDC WD20EARS-00S", 4096},
+	{"ATA     WDC WD20EARS-00Z", 4096},
+	{"ATA     WDC WD1600BEVT-0", 4096},
+	{"ATA     WDC WD2500BEVT-0", 4096},
+	{"ATA     WDC WD3200BEVT-0", 4096},
+	{"ATA     WDC WD5000BEVT-0", 4096},
+	/* Virtual disks: Assume zvols with default volblocksize */
+#if 0
+	{"ATA     QEMU HARDDISK   ", 8192},
+	{"IET     VIRTUAL-DISK    ", 8192},
+	{"OI      COMSTAR         ", 8192},
+	{"SUN     COMSTAR         ", 8192},
+	{"NETAPP  LUN             ", 8192},
+#endif
+};
+
+static const int vdev_disk_database_size =
+	sizeof (vdev_disk_database) / sizeof (vdev_disk_database[0]);
+
+#define	INQ_REPLY_LEN	96
+#define	INQ_CMD_LEN	6
+
+static boolean_t
+check_sector_size_database(char *path, int *sector_size)
+{
+	unsigned char inq_buff[INQ_REPLY_LEN];
+	unsigned char sense_buffer[32];
+	unsigned char inq_cmd_blk[INQ_CMD_LEN] =
+	    {INQUIRY, 0, 0, 0, INQ_REPLY_LEN, 0};
+	sg_io_hdr_t io_hdr;
+	int error;
+	int fd;
+	int i;
+
+	/* Prepare INQUIRY command */
+	memset(&io_hdr, 0, sizeof (sg_io_hdr_t));
+	io_hdr.interface_id = 'S';
+	io_hdr.cmd_len = sizeof (inq_cmd_blk);
+	io_hdr.mx_sb_len = sizeof (sense_buffer);
+	io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+	io_hdr.dxfer_len = INQ_REPLY_LEN;
+	io_hdr.dxferp = inq_buff;
+	io_hdr.cmdp = inq_cmd_blk;
+	io_hdr.sbp = sense_buffer;
+	io_hdr.timeout = 10;		/* 10 milliseconds is ample time */
+
+	if ((fd = open(path, O_RDONLY|O_DIRECT)) < 0)
+		return (B_FALSE);
+
+	error = ioctl(fd, SG_IO, (unsigned long) &io_hdr);
+
+	(void) close(fd);
+
+	if (error < 0)
+		return (B_FALSE);
+
+	if ((io_hdr.info & SG_INFO_OK_MASK) != SG_INFO_OK)
+		return (B_FALSE);
+
+	for (i = 0; i < vdev_disk_database_size; i++) {
+		if (memcmp(inq_buff + 8, vdev_disk_database[i].id, 24))
+			continue;
+
+		*sector_size = vdev_disk_database[i].sector_size;
+		return (B_TRUE);
+	}
+
+	return (B_FALSE);
+}
 
 /*PRINTFLIKE1*/
 static void
@@ -189,7 +370,6 @@ static int
 check_slice(const char *path, blkid_cache cache, int force, boolean_t isspare)
 {
 	int err;
-#ifdef HAVE_LIBBLKID
 	char *value;
 
 	/* No valid type detected device is safe to use */
@@ -202,7 +382,7 @@ check_slice(const char *path, blkid_cache cache, int force, boolean_t isspare)
 	 * using check_file() to see if it's safe.  The one safe
 	 * case is a spare device shared between multiple pools.
 	 */
-	if (strcmp(value, "zfs") == 0) {
+	if (strcmp(value, "zfs_member") == 0) {
 		err = check_file(path, force, isspare);
 	} else {
 		if (force) {
@@ -210,59 +390,52 @@ check_slice(const char *path, blkid_cache cache, int force, boolean_t isspare)
 		} else {
 			err = -1;
 			vdev_error(gettext("%s contains a filesystem of "
-				   "type '%s'\n"), path, value);
+			    "type '%s'\n"), path, value);
 		}
 	}
 
 	free(value);
-#else
-	err = check_file(path, force, isspare);
-#endif /* HAVE_LIBBLKID */
 
 	return (err);
 }
 
 /*
- * Validate a whole disk.  Iterate over all slices on the disk and make sure
- * that none is in use by calling check_slice().
+ * Validate that a disk including all partitions are safe to use.
+ *
+ * For EFI labeled disks this can done relatively easily with the libefi
+ * library.  The partition numbers are extracted from the label and used
+ * to generate the expected /dev/ paths.  Each partition can then be
+ * checked for conflicts.
+ *
+ * For non-EFI labeled disks (MBR/EBR/etc) the same process is possible
+ * but due to the lack of a readily available libraries this scanning is
+ * not implemented.  Instead only the device path as given is checked.
  */
 static int
 check_disk(const char *path, blkid_cache cache, int force,
-	   boolean_t isspare, boolean_t iswholedisk)
+    boolean_t isspare, boolean_t iswholedisk)
 {
 	struct dk_gpt *vtoc;
 	char slice_path[MAXPATHLEN];
 	int err = 0;
 	int fd, i;
 
-	/* This is not a wholedisk we only check the given partition */
 	if (!iswholedisk)
-		return check_slice(path, cache, force, isspare);
+		return (check_slice(path, cache, force, isspare));
 
-	/*
-	 * When the device is a whole disk try to read the efi partition
-	 * label.  If this is successful we safely check the all of the
-	 * partitions.  However, when it fails it may simply be because
-	 * the disk is partitioned via the MBR.  Since we currently can
-	 * not easily decode the MBR return a failure and prompt to the
-	 * user to use force option since we cannot check the partitions.
-	 */
-	if ((fd = open(path, O_RDWR|O_DIRECT|O_EXCL)) < 0) {
+	if ((fd = open(path, O_RDONLY|O_DIRECT)) < 0) {
 		check_error(errno);
-		return -1;
+		return (-1);
 	}
 
-	if ((err = efi_alloc_and_read(fd, &vtoc)) != 0) {
+	/*
+	 * Expected to fail for non-EFI labled disks.  Just check the device
+	 * as given and do not attempt to detect and scan partitions.
+	 */
+	err = efi_alloc_and_read(fd, &vtoc);
+	if (err) {
 		(void) close(fd);
-
-		if (force) {
-			return 0;
-		} else {
-			vdev_error(gettext("%s does not contain an EFI "
-			    "label but it may contain partition\n"
-			    "information in the MBR.\n"), path);
-			return -1;
-		}
+		return (check_slice(path, cache, force, isspare));
 	}
 
 	/*
@@ -275,12 +448,12 @@ check_disk(const char *path, blkid_cache cache, int force,
 		(void) close(fd);
 
 		if (force) {
-			/* Partitions will no be created using the backup */
-			return 0;
+			/* Partitions will now be created using the backup */
+			return (0);
 		} else {
 			vdev_error(gettext("%s contains a corrupt primary "
 			    "EFI label.\n"), path);
-			return -1;
+			return (-1);
 		}
 	}
 
@@ -306,16 +479,15 @@ check_disk(const char *path, blkid_cache cache, int force,
 	efi_free(vtoc);
 	(void) close(fd);
 
-        return (err);
+	return (err);
 }
 
 static int
 check_device(const char *path, boolean_t force,
-	     boolean_t isspare, boolean_t iswholedisk)
+    boolean_t isspare, boolean_t iswholedisk)
 {
 	static blkid_cache cache = NULL;
 
-#ifdef HAVE_LIBBLKID
 	/*
 	 * There is no easy way to add a correct blkid_put_cache() call,
 	 * memory will be reclaimed when the command exits.
@@ -325,18 +497,17 @@ check_device(const char *path, boolean_t force,
 
 		if ((err = blkid_get_cache(&cache, NULL)) != 0) {
 			check_error(err);
-			return -1;
+			return (-1);
 		}
 
 		if ((err = blkid_probe_all(cache)) != 0) {
 			blkid_put_cache(cache);
 			check_error(err);
-			return -1;
+			return (-1);
 		}
 	}
-#endif /* HAVE_LIBBLKID */
 
-	return check_disk(path, cache, force, isspare, iswholedisk);
+	return (check_disk(path, cache, force, isspare, iswholedisk));
 }
 
 /*
@@ -351,9 +522,9 @@ static boolean_t
 is_whole_disk(const char *path)
 {
 	struct dk_gpt *label;
-	int	fd;
+	int fd;
 
-	if ((fd = open(path, O_RDWR|O_DIRECT|O_EXCL)) < 0)
+	if ((fd = open(path, O_RDONLY|O_DIRECT)) < 0)
 		return (B_FALSE);
 	if (efi_alloc_and_init(fd, EFI_NUMPAR, &label) != 0) {
 		(void) close(fd);
@@ -366,26 +537,80 @@ is_whole_disk(const char *path)
 
 /*
  * This may be a shorthand device path or it could be total gibberish.
- * Check to see if it's a known device in /dev/, /dev/disk/by-id,
- * /dev/disk/by-label, /dev/disk/by-path, /dev/disk/by-uuid, or
- * /dev/disk/zpool/.  As part of this check, see if we've been given
- * an entire disk (minus the slice number).
+ * Check to see if it is a known device available in zfs_vdev_paths.
+ * As part of this check, see if we've been given an entire disk
+ * (minus the slice number).
  */
 static int
 is_shorthand_path(const char *arg, char *path,
-                  struct stat64 *statbuf, boolean_t *wholedisk)
+    struct stat64 *statbuf, boolean_t *wholedisk)
 {
-	if (zfs_resolve_shortname(arg, path, MAXPATHLEN) == 0) {
+	int error;
+
+	error = zfs_resolve_shortname(arg, path, MAXPATHLEN);
+	if (error == 0) {
 		*wholedisk = is_whole_disk(path);
 		if (*wholedisk || (stat64(path, statbuf) == 0))
 			return (0);
 	}
 
-	strlcpy(path, arg, sizeof(path));
-	memset(statbuf, 0, sizeof(*statbuf));
+	strlcpy(path, arg, sizeof (path));
+	memset(statbuf, 0, sizeof (*statbuf));
 	*wholedisk = B_FALSE;
 
-	return (ENOENT);
+	return (error);
+}
+
+/*
+ * Determine if the given path is a hot spare within the given configuration.
+ * If no configuration is given we rely solely on the label.
+ */
+static boolean_t
+is_spare(nvlist_t *config, const char *path)
+{
+	int fd;
+	pool_state_t state;
+	char *name = NULL;
+	nvlist_t *label;
+	uint64_t guid, spareguid;
+	nvlist_t *nvroot;
+	nvlist_t **spares;
+	uint_t i, nspares;
+	boolean_t inuse;
+
+	if ((fd = open(path, O_RDONLY)) < 0)
+		return (B_FALSE);
+
+	if (zpool_in_use(g_zfs, fd, &state, &name, &inuse) != 0 ||
+	    !inuse ||
+	    state != POOL_STATE_SPARE ||
+	    zpool_read_label(fd, &label, NULL) != 0) {
+		free(name);
+		(void) close(fd);
+		return (B_FALSE);
+	}
+	free(name);
+	(void) close(fd);
+
+	if (config == NULL)
+		return (B_TRUE);
+
+	verify(nvlist_lookup_uint64(label, ZPOOL_CONFIG_GUID, &guid) == 0);
+	nvlist_free(label);
+
+	verify(nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE,
+	    &nvroot) == 0);
+	if (nvlist_lookup_nvlist_array(nvroot, ZPOOL_CONFIG_SPARES,
+	    &spares, &nspares) == 0) {
+		for (i = 0; i < nspares; i++) {
+			verify(nvlist_lookup_uint64(spares[i],
+			    ZPOOL_CONFIG_GUID, &spareguid) == 0);
+			if (spareguid == guid)
+				return (B_TRUE);
+		}
+	}
+
+	return (B_FALSE);
 }
 
 /*
@@ -393,9 +618,9 @@ is_shorthand_path(const char *arg, char *path,
  * device, fill in the device id to make a complete nvlist.  Valid forms for a
  * leaf vdev are:
  *
- * 	/dev/xxx	Complete disk path
- * 	/xxx		Full path to file
- * 	xxx		Shorthand for /dev/disk/yyy/xxx
+ *	/dev/xxx	Complete disk path
+ *	/xxx		Full path to file
+ *	xxx		Shorthand for <zfs_vdev_paths>/xxx
  */
 static nvlist_t *
 make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
@@ -405,6 +630,7 @@ make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
 	nvlist_t *vdev = NULL;
 	char *type = NULL;
 	boolean_t wholedisk = B_FALSE;
+	uint64_t ashift = 0;
 	int err;
 
 	/*
@@ -490,18 +716,30 @@ make_leaf_vdev(nvlist_t *props, const char *arg, uint64_t is_log)
 		verify(nvlist_add_uint64(vdev, ZPOOL_CONFIG_WHOLE_DISK,
 		    (uint64_t)wholedisk) == 0);
 
+	/*
+	 * Override defaults if custom properties are provided.
+	 */
 	if (props != NULL) {
-		uint64_t ashift = 0;
 		char *value = NULL;
 
 		if (nvlist_lookup_string(props,
 		    zpool_prop_to_name(ZPOOL_PROP_ASHIFT), &value) == 0)
 			zfs_nicestrtonum(NULL, value, &ashift);
-
-		if (ashift > 0)
-			verify(nvlist_add_uint64(vdev, ZPOOL_CONFIG_ASHIFT,
-			    ashift) == 0);
 	}
+
+	/*
+	 * If the device is known to incorrectly report its physical sector
+	 * size explicitly provide the known correct value.
+	 */
+	if (ashift == 0) {
+		int sector_size;
+
+		if (check_sector_size_database(path, &sector_size) == B_TRUE)
+			ashift = highbit64(sector_size) - 1;
+	}
+
+	if (ashift > 0)
+		nvlist_add_uint64(vdev, ZPOOL_CONFIG_ASHIFT, ashift);
 
 	return (vdev);
 }
@@ -894,7 +1132,7 @@ zero_label(char *path)
 		return (-1);
 	}
 
-	return 0;
+	return (0);
 }
 
 /*
@@ -912,11 +1150,13 @@ make_disks(zpool_handle_t *zhp, nvlist_t *nv)
 {
 	nvlist_t **child;
 	uint_t c, children;
-	char *type, *path, *diskname;
+	char *type, *path;
 	char devpath[MAXPATHLEN];
 	char udevpath[MAXPATHLEN];
 	uint64_t wholedisk;
 	struct stat64 statbuf;
+	int is_exclusive = 0;
+	int fd;
 	int ret;
 
 	verify(nvlist_lookup_string(nv, ZPOOL_CONFIG_TYPE, &type) == 0);
@@ -939,8 +1179,14 @@ make_disks(zpool_handle_t *zhp, nvlist_t *nv)
 		    &wholedisk));
 
 		if (!wholedisk) {
-			ret = zero_label(path);
-			return (ret);
+			/*
+			 * Update device id string for mpath nodes (Linux only)
+			 */
+			if (is_mpath_whole_disk(path))
+				update_vdev_config_dev_strs(nv);
+
+			(void) zero_label(path);
+			return (0);
 		}
 
 		if (realpath(path, devpath) == NULL) {
@@ -952,46 +1198,79 @@ make_disks(zpool_handle_t *zhp, nvlist_t *nv)
 
 		/*
 		 * Remove any previously existing symlink from a udev path to
-		 * the device before labeling the disk.  This makes
-		 * zpool_label_disk_wait() truly wait for the new link to show
-		 * up instead of returning if it finds an old link still in
-		 * place.  Otherwise there is a window between when udev
-		 * deletes and recreates the link during which access attempts
-		 * will fail with ENOENT.
+		 * the device before labeling the disk.  This ensures that
+		 * only newly created links are used.  Otherwise there is a
+		 * window between when udev deletes and recreates the link
+		 * during which access attempts will fail with ENOENT.
 		 */
-		zfs_append_partition(path, udevpath, sizeof (udevpath));
-		if ((strncmp(udevpath, UDISK_ROOT, strlen(UDISK_ROOT)) == 0) &&
-		    (lstat64(udevpath, &statbuf) == 0) &&
-		    S_ISLNK(statbuf.st_mode))
-			(void) unlink(udevpath);
+		strncpy(udevpath, path, MAXPATHLEN);
+		(void) zfs_append_partition(udevpath, MAXPATHLEN);
 
-		diskname = strrchr(devpath, '/');
-		assert(diskname != NULL);
-		diskname++;
-		if (zpool_label_disk(g_zfs, zhp, diskname) == -1)
-			return (-1);
-
-		/*
-		 * Now we've labeled the disk and the partitions have been
-		 * created.  We still need to wait for udev to create the
-		 * symlinks to those partitions.
-		 */
-		if ((ret = zpool_label_disk_wait(udevpath, 1000)) != 0) {
-			(void) fprintf(stderr,
-			    gettext( "cannot resolve path '%s'\n"), udevpath);
-			return (-1);
+		fd = open(devpath, O_RDWR|O_EXCL);
+		if (fd == -1) {
+			if (errno == EBUSY)
+				is_exclusive = 1;
+		} else {
+			(void) close(fd);
 		}
 
 		/*
-		 * Update the path to refer to FIRST_SLICE.  The presence of
+		 * If the partition exists, contains a valid spare label,
+		 * and is opened exclusively there is no need to partition
+		 * it.  Hot spares have already been partitioned and are
+		 * held open exclusively by the kernel as a safety measure.
+		 *
+		 * If the provided path is for a /dev/disk/ device its
+		 * symbolic link will be removed, partition table created,
+		 * and then block until udev creates the new link.
+		 */
+		if (!is_exclusive || !is_spare(NULL, udevpath)) {
+			char *devnode = strrchr(devpath, '/') + 1;
+
+			ret = strncmp(udevpath, UDISK_ROOT, strlen(UDISK_ROOT));
+			if (ret == 0) {
+				ret = lstat64(udevpath, &statbuf);
+				if (ret == 0 && S_ISLNK(statbuf.st_mode))
+					(void) unlink(udevpath);
+			}
+
+			/*
+			 * When labeling a pool the raw device node name
+			 * is provided as it appears under /dev/.
+			 */
+			if (zpool_label_disk(g_zfs, zhp, devnode) == -1)
+				return (-1);
+
+			/*
+			 * Wait for udev to signal the device is available
+			 * by the provided path.
+			 */
+			ret = zpool_label_disk_wait(udevpath, DISK_LABEL_WAIT);
+			if (ret) {
+				(void) fprintf(stderr,
+				    gettext("missing link: %s was "
+				    "partitioned but %s is missing\n"),
+				    devnode, udevpath);
+				return (ret);
+			}
+
+			ret = zero_label(udevpath);
+			if (ret)
+				return (ret);
+		}
+
+		/*
+		 * Update the path to refer to the partition.  The presence of
 		 * the 'whole_disk' field indicates to the CLI that we should
-		 * chop off the slice number when displaying the device in
+		 * chop off the partition number when displaying the device in
 		 * future output.
 		 */
 		verify(nvlist_add_string(nv, ZPOOL_CONFIG_PATH, udevpath) == 0);
 
-		/* Just in case this partition already existed. */
-		(void) zero_label(udevpath);
+		/*
+		 * Update device id strings for whole disks (Linux only)
+		 */
+		update_vdev_config_dev_strs(nv);
 
 		return (0);
 	}
@@ -1016,59 +1295,11 @@ make_disks(zpool_handle_t *zhp, nvlist_t *nv)
 }
 
 /*
- * Determine if the given path is a hot spare within the given configuration.
- */
-static boolean_t
-is_spare(nvlist_t *config, const char *path)
-{
-	int fd;
-	pool_state_t state;
-	char *name = NULL;
-	nvlist_t *label;
-	uint64_t guid, spareguid;
-	nvlist_t *nvroot;
-	nvlist_t **spares;
-	uint_t i, nspares;
-	boolean_t inuse;
-
-	if ((fd = open(path, O_RDONLY|O_EXCL)) < 0)
-		return (B_FALSE);
-
-	if (zpool_in_use(g_zfs, fd, &state, &name, &inuse) != 0 ||
-	    !inuse ||
-	    state != POOL_STATE_SPARE ||
-	    zpool_read_label(fd, &label) != 0) {
-		free(name);
-		(void) close(fd);
-		return (B_FALSE);
-	}
-	free(name);
-	(void) close(fd);
-
-	verify(nvlist_lookup_uint64(label, ZPOOL_CONFIG_GUID, &guid) == 0);
-	nvlist_free(label);
-
-	verify(nvlist_lookup_nvlist(config, ZPOOL_CONFIG_VDEV_TREE,
-	    &nvroot) == 0);
-	if (nvlist_lookup_nvlist_array(nvroot, ZPOOL_CONFIG_SPARES,
-	    &spares, &nspares) == 0) {
-		for (i = 0; i < nspares; i++) {
-			verify(nvlist_lookup_uint64(spares[i],
-			    ZPOOL_CONFIG_GUID, &spareguid) == 0);
-			if (spareguid == guid)
-				return (B_TRUE);
-		}
-	}
-
-	return (B_FALSE);
-}
-
-/*
  * Go through and find any devices that are in use.  We rely on libdiskmgt for
  * the majority of this task.
  */
-static int
-check_in_use(nvlist_t *config, nvlist_t *nv, boolean_t force,
+static boolean_t
+is_device_in_use(nvlist_t *config, nvlist_t *nv, boolean_t force,
     boolean_t replacing, boolean_t isspare)
 {
 	nvlist_t **child;
@@ -1077,6 +1308,7 @@ check_in_use(nvlist_t *config, nvlist_t *nv, boolean_t force,
 	int ret = 0;
 	char buf[MAXPATHLEN];
 	uint64_t wholedisk = B_FALSE;
+	boolean_t anyinuse = B_FALSE;
 
 	verify(nvlist_lookup_string(nv, ZPOOL_CONFIG_TYPE, &type) == 0);
 
@@ -1086,7 +1318,7 @@ check_in_use(nvlist_t *config, nvlist_t *nv, boolean_t force,
 		verify(!nvlist_lookup_string(nv, ZPOOL_CONFIG_PATH, &path));
 		if (strcmp(type, VDEV_TYPE_DISK) == 0)
 			verify(!nvlist_lookup_uint64(nv,
-			       ZPOOL_CONFIG_WHOLE_DISK, &wholedisk));
+			    ZPOOL_CONFIG_WHOLE_DISK, &wholedisk));
 
 		/*
 		 * As a generic check, we look to see if this is a replace of a
@@ -1094,45 +1326,46 @@ check_in_use(nvlist_t *config, nvlist_t *nv, boolean_t force,
 		 * regardless of what libblkid or zpool_in_use() says.
 		 */
 		if (replacing) {
-			if (wholedisk)
-				(void) snprintf(buf, sizeof (buf), "%ss0",
-				    path);
-			else
-				(void) strlcpy(buf, path, sizeof (buf));
+			(void) strlcpy(buf, path, sizeof (buf));
+			if (wholedisk) {
+				ret = zfs_append_partition(buf,  sizeof (buf));
+				if (ret == -1)
+					return (-1);
+			}
 
 			if (is_spare(config, buf))
-				return (0);
+				return (B_FALSE);
 		}
 
 		if (strcmp(type, VDEV_TYPE_DISK) == 0)
 			ret = check_device(path, force, isspare, wholedisk);
 
-		if (strcmp(type, VDEV_TYPE_FILE) == 0)
+		else if (strcmp(type, VDEV_TYPE_FILE) == 0)
 			ret = check_file(path, force, isspare);
 
-		return (ret);
+		return (ret != 0);
 	}
 
 	for (c = 0; c < children; c++)
-		if ((ret = check_in_use(config, child[c], force,
-		    replacing, B_FALSE)) != 0)
-			return (ret);
+		if (is_device_in_use(config, child[c], force, replacing,
+		    B_FALSE))
+			anyinuse = B_TRUE;
 
 	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_SPARES,
 	    &child, &children) == 0)
 		for (c = 0; c < children; c++)
-			if ((ret = check_in_use(config, child[c], force,
-			    replacing, B_TRUE)) != 0)
-				return (ret);
+			if (is_device_in_use(config, child[c], force, replacing,
+			    B_TRUE))
+				anyinuse = B_TRUE;
 
 	if (nvlist_lookup_nvlist_array(nv, ZPOOL_CONFIG_L2CACHE,
 	    &child, &children) == 0)
 		for (c = 0; c < children; c++)
-			if ((ret = check_in_use(config, child[c], force,
-			    replacing, B_FALSE)) != 0)
-				return (ret);
+			if (is_device_in_use(config, child[c], force, replacing,
+			    B_FALSE))
+				anyinuse = B_TRUE;
 
-	return (0);
+	return (anyinuse);
 }
 
 static const char *
@@ -1288,8 +1521,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 				    children * sizeof (nvlist_t *));
 				if (child == NULL)
 					zpool_no_memory();
-				if ((nv = make_leaf_vdev(props, argv[c], B_FALSE))
-				    == NULL)
+				if ((nv = make_leaf_vdev(props, argv[c],
+				    B_FALSE)) == NULL)
 					return (NULL);
 				child[children - 1] = nv;
 			}
@@ -1344,7 +1577,8 @@ construct_spec(nvlist_t *props, int argc, char **argv)
 			 * We have a device.  Pass off to make_leaf_vdev() to
 			 * construct the appropriate nvlist describing the vdev.
 			 */
-			if ((nv = make_leaf_vdev(props, argv[0], is_log)) == NULL)
+			if ((nv = make_leaf_vdev(props, argv[0],
+			    is_log)) == NULL)
 				return (NULL);
 			if (is_log)
 				nlogs++;
@@ -1441,8 +1675,7 @@ split_mirror_vdev(zpool_handle_t *zhp, char *newname, nvlist_t *props,
 	}
 
 	if (zpool_vdev_split(zhp, newname, &newroot, props, flags) != 0) {
-		if (newroot != NULL)
-			nvlist_free(newroot);
+		nvlist_free(newroot);
 		return (NULL);
 	}
 
@@ -1475,8 +1708,10 @@ make_root_vdev(zpool_handle_t *zhp, nvlist_t *props, int force, int check_rep,
 	if ((newroot = construct_spec(props, argc, argv)) == NULL)
 		return (NULL);
 
-	if (zhp && ((poolconfig = zpool_get_config(zhp, NULL)) == NULL))
+	if (zhp && ((poolconfig = zpool_get_config(zhp, NULL)) == NULL)) {
+		nvlist_free(newroot);
 		return (NULL);
+	}
 
 	/*
 	 * Validate each device to make sure that its not shared with another
@@ -1484,7 +1719,7 @@ make_root_vdev(zpool_handle_t *zhp, nvlist_t *props, int force, int check_rep,
 	 * uses (such as a dedicated dump device) that even '-f' cannot
 	 * override.
 	 */
-	if (check_in_use(poolconfig, newroot, force, replacing, B_FALSE) != 0) {
+	if (is_device_in_use(poolconfig, newroot, force, replacing, B_FALSE)) {
 		nvlist_free(newroot);
 		return (NULL);
 	}

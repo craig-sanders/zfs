@@ -21,20 +21,22 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  */
 
-#ifndef	_LIBFS_IMPL_H
-#define	_LIBFS_IMPL_H
+#ifndef	_LIBZFS_IMPL_H
+#define	_LIBZFS_IMPL_H
 
-#include <sys/dmu.h>
 #include <sys/fs/zfs.h>
-#include <sys/zfs_ioctl.h>
 #include <sys/spa.h>
 #include <sys/nvpair.h>
+#include <sys/dmu.h>
+#include <sys/zfs_ioctl.h>
 
 #include <libuutil.h>
 #include <libzfs.h>
 #include <libshare.h>
+#include <libzfs_core.h>
 
 #if defined(HAVE_LIBTOPO)
 #include <fm/libtopo.h>
@@ -43,11 +45,6 @@
 #ifdef	__cplusplus
 extern "C" {
 #endif
-
-#ifdef	VERIFY
-#undef	VERIFY
-#endif
-#define	VERIFY	verify
 
 typedef struct libzfs_fru {
 	char *zf_device;
@@ -68,7 +65,6 @@ struct libzfs_handle {
 	int libzfs_desc_active;
 	char libzfs_action[1024];
 	char libzfs_desc[1024];
-	char *libzfs_log_str;
 	int libzfs_printerr;
 	int libzfs_storeerr; /* stuff error messages into buffer */
 	void *libzfs_sharehdl; /* libshare handle */
@@ -89,7 +85,7 @@ struct libzfs_handle {
 struct zfs_handle {
 	libzfs_handle_t *zfs_hdl;
 	zpool_handle_t *zpool_hdl;
-	char zfs_name[ZFS_MAXNAMELEN];
+	char zfs_name[ZFS_MAX_DATASET_NAME_LEN];
 	zfs_type_t zfs_type; /* type including snapshot */
 	zfs_type_t zfs_head_type; /* type excluding snapshot */
 	dmu_objset_stats_t zfs_dmustats;
@@ -110,7 +106,7 @@ struct zfs_handle {
 struct zpool_handle {
 	libzfs_handle_t *zpool_hdl;
 	zpool_handle_t *zpool_next;
-	char zpool_name[ZPOOL_MAXNAMELEN];
+	char zpool_name[ZFS_MAX_DATASET_NAME_LEN];
 	int zpool_state;
 	size_t zpool_config_size;
 	nvlist_t *zpool_config;
@@ -119,7 +115,7 @@ struct zpool_handle {
 	diskaddr_t zpool_start_block;
 };
 
-typedef  enum {
+typedef enum {
 	PROTO_NFS = 0,
 	PROTO_SMB = 1,
 	PROTO_END = 2
@@ -149,9 +145,8 @@ int zfs_standard_error_fmt(libzfs_handle_t *, int, const char *, ...);
 int zpool_standard_error(libzfs_handle_t *, int, const char *);
 int zpool_standard_error_fmt(libzfs_handle_t *, int, const char *, ...);
 
-int get_dependents(libzfs_handle_t *, boolean_t, const char *, char ***,
-    size_t *);
-
+zfs_handle_t *make_dataset_handle_zc(libzfs_handle_t *, zfs_cmd_t *);
+zfs_handle_t *make_dataset_simple_handle_zc(zfs_handle_t *, zfs_cmd_t *);
 
 int zprop_parse_value(libzfs_handle_t *, nvpair_t *, int, zfs_type_t,
     nvlist_t *, char **, uint64_t *, const char *);
@@ -188,11 +183,11 @@ int create_parents(libzfs_handle_t *, char *, int);
 boolean_t isa_child_of(const char *dataset, const char *parent);
 
 zfs_handle_t *make_dataset_handle(libzfs_handle_t *, const char *);
+zfs_handle_t *make_bookmark_handle(zfs_handle_t *, const char *,
+    nvlist_t *props);
 
 int zpool_open_silent(libzfs_handle_t *, const char *, zpool_handle_t **);
 
-int zvol_create_link(libzfs_handle_t *, const char *);
-int zvol_remove_link(libzfs_handle_t *, const char *);
 boolean_t zpool_name_valid(libzfs_handle_t *, boolean_t, const char *);
 
 int zfs_validate_name(libzfs_handle_t *hdl, const char *path, int type,
@@ -217,4 +212,4 @@ extern void libzfs_fru_clear(libzfs_handle_t *, boolean_t);
 }
 #endif
 
-#endif	/* _LIBFS_IMPL_H */
+#endif	/* _LIBZFS_IMPL_H */

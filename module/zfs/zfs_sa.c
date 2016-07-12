@@ -22,8 +22,7 @@
  * Copyright (c) 2010, Oracle and/or its affiliates. All rights reserved.
  */
 
-#include <sys/types.h>
-#include <sys/param.h>
+#include <sys/zfs_context.h>
 #include <sys/vnode.h>
 #include <sys/sa.h>
 #include <sys/zfs_acl.h>
@@ -98,8 +97,7 @@ zfs_sa_symlink(znode_t *zp, char *link, int len, dmu_tx_t *tx)
 	dmu_buf_t *db = sa_get_db(zp->z_sa_hdl);
 
 	if (ZFS_OLD_ZNODE_PHYS_SIZE + len <= dmu_bonus_max()) {
-		VERIFY(dmu_set_bonus(db,
-		    len + ZFS_OLD_ZNODE_PHYS_SIZE, tx) == 0);
+		VERIFY0(dmu_set_bonus(db, len + ZFS_OLD_ZNODE_PHYS_SIZE, tx));
 		if (len) {
 			bcopy(link, (caddr_t)db->db_data +
 			    ZFS_OLD_ZNODE_PHYS_SIZE, len);
@@ -108,8 +106,8 @@ zfs_sa_symlink(znode_t *zp, char *link, int len, dmu_tx_t *tx)
 		dmu_buf_t *dbp;
 
 		zfs_grow_blocksize(zp, len, tx);
-		VERIFY(0 == dmu_buf_hold(ZTOZSB(zp)->z_os,
-		    zp->z_id, 0, FTAG, &dbp, DMU_READ_NO_PREFETCH));
+		VERIFY0(dmu_buf_hold(ZTOZSB(zp)->z_os, zp->z_id, 0, FTAG, &dbp,
+		    DMU_READ_NO_PREFETCH));
 
 		dmu_buf_will_dirty(dbp, tx);
 
@@ -188,7 +186,6 @@ int
 zfs_sa_get_xattr(znode_t *zp)
 {
 	zfs_sb_t *zsb = ZTOZSB(zp);
-	sa_handle_t *sa;
 	char *obj;
 	int size;
 	int error;
@@ -197,14 +194,8 @@ zfs_sa_get_xattr(znode_t *zp)
 	ASSERT(!zp->z_xattr_cached);
 	ASSERT(zp->z_is_sa);
 
-	error = sa_handle_get(zsb->z_os, zp->z_id, NULL, SA_HDL_PRIVATE, &sa);
-	if (error)
-		return (error);
-
-	error = sa_size(sa, SA_ZPL_DXATTR(zsb), &size);
+	error = sa_size(zp->z_sa_hdl, SA_ZPL_DXATTR(zsb), &size);
 	if (error) {
-		sa_handle_destroy(sa);
-
 		if (error == ENOENT)
 			return nvlist_alloc(&zp->z_xattr_cached,
 			    NV_UNIQUE_NAME, KM_SLEEP);
@@ -212,14 +203,13 @@ zfs_sa_get_xattr(znode_t *zp)
 			return (error);
 	}
 
-	obj = sa_spill_alloc(KM_SLEEP);
+	obj = zio_buf_alloc(size);
 
-	error = sa_lookup(sa, SA_ZPL_DXATTR(zsb), obj, size);
+	error = sa_lookup(zp->z_sa_hdl, SA_ZPL_DXATTR(zsb), obj, size);
 	if (error == 0)
 		error = nvlist_unpack(obj, size, &zp->z_xattr_cached, KM_SLEEP);
 
-	sa_spill_free(obj);
-	sa_handle_destroy(sa);
+	zio_buf_free(obj, size);
 
 	return (error);
 }
@@ -228,7 +218,6 @@ int
 zfs_sa_set_xattr(znode_t *zp)
 {
 	zfs_sb_t *zsb = ZTOZSB(zp);
-	sa_handle_t *sa;
 	dmu_tx_t *tx;
 	char *obj;
 	size_t size;
@@ -239,47 +228,32 @@ zfs_sa_set_xattr(znode_t *zp)
 	ASSERT(zp->z_is_sa);
 
 	error = nvlist_size(zp->z_xattr_cached, &size, NV_ENCODE_XDR);
+	if ((error == 0) && (size > SA_ATTR_MAX_LEN))
+		error = EFBIG;
 	if (error)
 		goto out;
 
-	obj = sa_spill_alloc(KM_SLEEP);
+	obj = zio_buf_alloc(size);
 
 	error = nvlist_pack(zp->z_xattr_cached, &obj, &size,
 	    NV_ENCODE_XDR, KM_SLEEP);
 	if (error)
 		goto out_free;
 
-	/*
-	 * A private SA handle must be used to ensure we can drop the hold
-	 * on the spill block prior to calling dmu_tx_commit().  If we call
-	 * dmu_tx_commit() before sa_handle_destroy(), then our hold will
-	 * trigger a copy of the buffer at txg sync time.  This is done to
-	 * prevent data from leaking in to the syncing txg.  As a result
-	 * the original dirty spill block will be remain dirty in the arc
-	 * while the copy is written and laundered.
-	 */
-	error = sa_handle_get(zsb->z_os, zp->z_id, NULL, SA_HDL_PRIVATE, &sa);
-	if (error)
-		goto out_free;
-
 	tx = dmu_tx_create(zsb->z_os);
 	dmu_tx_hold_sa_create(tx, size);
-	dmu_tx_hold_sa(tx, sa, B_TRUE);
+	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_TRUE);
 
 	error = dmu_tx_assign(tx, TXG_WAIT);
 	if (error) {
 		dmu_tx_abort(tx);
-		sa_handle_destroy(sa);
 	} else {
-		error = sa_update(sa, SA_ZPL_DXATTR(zsb), obj, size, tx);
-		sa_handle_destroy(sa);
-		if (error)
-			dmu_tx_abort(tx);
-		else
-			dmu_tx_commit(tx);
+		VERIFY0(sa_update(zp->z_sa_hdl, SA_ZPL_DXATTR(zsb),
+		    obj, size, tx));
+		dmu_tx_commit(tx);
 	}
 out_free:
-	sa_spill_free(obj);
+	zio_buf_free(obj, size);
 out:
 	return (error);
 }
@@ -287,7 +261,7 @@ out:
 /*
  * I'm not convinced we should do any of this upgrade.
  * since the SA code can read both old/new znode formats
- * with probably little to know performance difference.
+ * with probably little to no performance difference.
  *
  * All new files will be created with the new format.
  */
@@ -301,8 +275,8 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	int count = 0;
 	sa_bulk_attr_t *bulk, *sa_attrs;
 	zfs_acl_locator_cb_t locate = { 0 };
-	uint64_t uid, gid, mode, rdev, xattr, parent;
-	uint64_t crtime[2], mtime[2], ctime[2];
+	uint64_t uid, gid, mode, rdev, xattr, parent, tmp_gen;
+	uint64_t crtime[2], mtime[2], ctime[2], atime[2];
 	zfs_acl_phys_t znode_acl;
 	char scanstamp[AV_SCANSTAMP_SZ];
 	boolean_t drop_lock = B_FALSE;
@@ -333,7 +307,8 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	}
 
 	/* First do a bulk query of the attributes that aren't cached */
-	bulk = kmem_alloc(sizeof(sa_bulk_attr_t) * 20, KM_SLEEP);
+	bulk = kmem_alloc(sizeof (sa_bulk_attr_t) * 20, KM_SLEEP);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zsb), NULL, &atime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zsb), NULL, &mtime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zsb), NULL, &ctime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CRTIME(zsb), NULL, &crtime, 16);
@@ -343,11 +318,12 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_RDEV(zsb), NULL, &rdev, 8);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zsb), NULL, &uid, 8);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zsb), NULL, &gid, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GEN(zsb), NULL, &tmp_gen, 8);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ZNODE_ACL(zsb), NULL,
 	    &znode_acl, 88);
 
 	if (sa_bulk_lookup_locked(hdl, bulk, count) != 0) {
-		kmem_free(bulk, sizeof(sa_bulk_attr_t) * 20);
+		kmem_free(bulk, sizeof (sa_bulk_attr_t) * 20);
 		goto done;
 	}
 
@@ -356,12 +332,11 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	 * it is such a way to pick up an already existing layout number
 	 */
 	count = 0;
-	sa_attrs = kmem_zalloc(sizeof(sa_bulk_attr_t) * 20, KM_SLEEP);
+	sa_attrs = kmem_zalloc(sizeof (sa_bulk_attr_t) * 20, KM_SLEEP);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_MODE(zsb), NULL, &mode, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_SIZE(zsb), NULL,
 	    &zp->z_size, 8);
-	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_GEN(zsb),
-	    NULL, &zp->z_gen, 8);
+	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_GEN(zsb), NULL, &tmp_gen, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_UID(zsb), NULL, &uid, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_GID(zsb), NULL, &gid, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_PARENT(zsb),
@@ -369,7 +344,7 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_FLAGS(zsb), NULL,
 	    &zp->z_pflags, 8);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_ATIME(zsb), NULL,
-	    zp->z_atime, 16);
+	    &atime, 16);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_MTIME(zsb), NULL,
 	    &mtime, 16);
 	SA_ADD_BULK_ATTR(sa_attrs, count, SA_ZPL_CTIME(zsb), NULL,
@@ -413,8 +388,8 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 		    znode_acl.z_acl_extern_obj, tx));
 
 	zp->z_is_sa = B_TRUE;
-	kmem_free(sa_attrs, sizeof(sa_bulk_attr_t) * 20);
-	kmem_free(bulk, sizeof(sa_bulk_attr_t) * 20);
+	kmem_free(sa_attrs, sizeof (sa_bulk_attr_t) * 20);
+	kmem_free(bulk, sizeof (sa_bulk_attr_t) * 20);
 done:
 	if (drop_lock)
 		mutex_exit(&zp->z_lock);

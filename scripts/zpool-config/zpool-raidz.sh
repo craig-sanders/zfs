@@ -2,10 +2,9 @@
 #
 # Zpool Raid-Z Configuration
 #
-# This script is used to simplify testing with the /dev/disk/zpool/[A-Z][1-n]
-# devices.  It assumes that you have already populated /dev/disk/zpool/ by
-# creating an /etc/zfs/zdev.conf file based on your system design.  You may
-# use the zpool_layout command or manually create your own config file.
+# This script is used to test with the /dev/disk/by-vdev/[A-Z][1-n] devices.
+# It assumes that you have already populated /dev/disk/by-vdev/ by creating
+# an /etc/zfs/vdev_id.conf file based on your system design.
 #
 # You can then use either the zpool-create.sh or the zpios.sh test script to
 # test various Raid-Z configurations by adjusting the following tunables.
@@ -78,8 +77,8 @@ zpool_create() {
         raidz_setup ${RANKS} ${CHANNELS}
 
 	ZPOOL_DEVICES="${RAIDZS[*]} ${ZIL} ${L2ARC}"
-        msg ${ZPOOL} create ${FORCE_FLAG} ${ZPOOL_NAME} ${ZPOOL_DEVICES}
-        ${ZPOOL} create ${FORCE_FLAG} ${ZPOOL_NAME} ${ZPOOL_DEVICES} || exit 1
+        msg ${ZPOOL} create ${ZPOOL_FLAGS} ${ZPOOL_NAME} ${ZPOOL_DEVICES}
+        ${ZPOOL} create ${ZPOOL_FLAGS} ${ZPOOL_NAME} ${ZPOOL_DEVICES} || exit 1
 }
 
 zpool_destroy() {

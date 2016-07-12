@@ -32,33 +32,39 @@ TESTS_SKIP=${TESTS_SKIP:-}
 
 prefix=@prefix@
 exec_prefix=@exec_prefix@
-libexecdir=@libexecdir@
-pkglibexecdir=${libexecdir}/@PACKAGE@
+pkgdatadir=@datarootdir@/@PACKAGE@
 bindir=@bindir@
 sbindir=@sbindir@
 udevdir=@udevdir@
 udevruledir=@udevruledir@
+mounthelperdir=@mounthelperdir@
 sysconfdir=@sysconfdir@
+localstatedir=@localstatedir@
 
 ETCDIR=${ETCDIR:-/etc}
-DEVDIR=${DEVDIR:-/dev/disk/zpool}
-ZPOOLDIR=${ZPOOLDIR:-${pkglibexecdir}/zpool-config}
-ZPIOSDIR=${ZPIOSDIR:-${pkglibexecdir}/zpios-test}
-ZPIOSPROFILEDIR=${ZPIOSPROFILEDIR:-${pkglibexecdir}/zpios-profile}
+DEVDIR=${DEVDIR:-/dev/disk/by-vdev}
+ZPOOLDIR=${ZPOOLDIR:-${pkgdatadir}/zpool-config}
+ZPIOSDIR=${ZPIOSDIR:-${pkgdatadir}/zpios-test}
+ZPIOSPROFILEDIR=${ZPIOSPROFILEDIR:-${pkgdatadir}/zpios-profile}
+TESTSDIR=${TESTSDIR:-${pkgdatadir}/zfs-tests}
+RUNFILEDIR=${RUNFILEDIR:-${pkgdatadir}/runfiles}
 
 ZDB=${ZDB:-${sbindir}/zdb}
 ZFS=${ZFS:-${sbindir}/zfs}
 ZINJECT=${ZINJECT:-${sbindir}/zinject}
+ZHACK=${ZHACK:-${sbindir}/zhack}
 ZPOOL=${ZPOOL:-${sbindir}/zpool}
-ZPOOL_ID=${ZPOOL_ID:-${bindir}/zpool_id}
 ZTEST=${ZTEST:-${sbindir}/ztest}
 ZPIOS=${ZPIOS:-${sbindir}/zpios}
 
-COMMON_SH=${COMMON_SH:-${pkglibexecdir}/common.sh}
-ZFS_SH=${ZFS_SH:-${pkglibexecdir}/zfs.sh}
-ZPOOL_CREATE_SH=${ZPOOL_CREATE_SH:-${pkglibexecdir}/zpool-create.sh}
-ZPIOS_SH=${ZPIOS_SH:-${pkglibexecdir}/zpios.sh}
-ZPIOS_SURVEY_SH=${ZPIOS_SURVEY_SH:-${pkglibexecdir}/zpios-survey.sh}
+COMMON_SH=${COMMON_SH:-${pkgdatadir}/common.sh}
+ZFS_SH=${ZFS_SH:-${pkgdatadir}/zfs.sh}
+ZPOOL_CREATE_SH=${ZPOOL_CREATE_SH:-${pkgdatadir}/zpool-create.sh}
+ZPIOS_SH=${ZPIOS_SH:-${pkgdatadir}/zpios.sh}
+ZPIOS_SURVEY_SH=${ZPIOS_SURVEY_SH:-${pkgdatadir}/zpios-survey.sh}
+TEST_RUNNER=${TEST_RUNNER:-${pkgdatadir}/test-runner/bin/test-runner.py}
+STF_TOOLS=${STF_TOOLS:-${pkgdatadir}/test-runner}
+STF_SUITE=${STF_SUITE:-${pkgdatadir}/zfs-tests}
 
 LDMOD=${LDMOD:-/sbin/modprobe}
 LSMOD=${LSMOD:-/sbin/lsmod}
@@ -66,6 +72,7 @@ RMMOD=${RMMOD:-/sbin/rmmod}
 INFOMOD=${INFOMOD:-/sbin/modinfo}
 LOSETUP=${LOSETUP:-/sbin/losetup}
 MDADM=${MDADM:-/sbin/mdadm}
+DMSETUP=${DMSETUP:-/sbin/dmsetup}
 PARTED=${PARTED:-/sbin/parted}
 BLOCKDEV=${BLOCKDEV:-/sbin/blockdev}
 LSSCSI=${LSSCSI:-/usr/bin/lsscsi}
@@ -73,6 +80,9 @@ SCSIRESCAN=${SCSIRESCAN:-/usr/bin/scsi-rescan}
 SYSCTL=${SYSCTL:-/sbin/sysctl}
 UDEVADM=${UDEVADM:-/sbin/udevadm}
 AWK=${AWK:-/usr/bin/awk}
+GDB=${GDB:-/usr/bin/gdb}
+
+ZED_PIDFILE=${ZED_PIDFILE:-${localstatedir}/run/zed.pid}
 
 COLOR_BLACK="\033[0;30m"
 COLOR_DK_GRAY="\033[1;30m"
@@ -116,17 +126,33 @@ skip() {
 	echo -e "${COLOR_BROWN}Skip${COLOR_RESET}"
 }
 
+populate() {
+	local ROOT=$1
+	local MAX_DIR_SIZE=$2
+	local MAX_FILE_SIZE=$3
+
+	mkdir -p $ROOT/{a,b,c,d,e,f,g}/{h,i}
+	DIRS=`find $ROOT`
+
+	for DIR in $DIRS; do
+		COUNT=$(($RANDOM % $MAX_DIR_SIZE))
+
+		for i in `seq $COUNT`; do
+			FILE=`mktemp -p ${DIR}`
+			SIZE=$(($RANDOM % $MAX_FILE_SIZE))
+			dd if=/dev/urandom of=$FILE bs=1k count=$SIZE &>/dev/null
+		done
+	done
+
+	return 0
+}
+
 init() {
-	# Disable the udev rule 90-zfs.rules to prevent the zfs module
-	# stack from being loaded due to the detection of a zfs device.
-	# This is important because the test scripts require full control
-	# over when and how the modules are loaded/unloaded.  A trap is
-	# set to ensure the udev rule is correctly replaced on exit.
-	local RULE=${udevruledir}/90-zfs.rules
-	if test -e  ${RULE}; then
-		trap "mv ${RULE}.disabled ${RULE}; exit $?" INT TERM EXIT
-		mv ${RULE} ${RULE}.disabled
-	fi
+	# Create a random directory tree of files and sub-directories to
+	# to act as a copy source for the various regression tests.
+	SRC_DIR=`mktemp -d -p /var/tmp/ zfs.src.XXXXXXXX`
+	trap "rm -Rf $SRC_DIR" INT TERM EXIT
+	populate $SRC_DIR 10 100
 }
 
 spl_dump_log() {
@@ -179,7 +205,11 @@ load_module() {
 		echo "Loading ${NAME} ($@)"
 	fi
 
-	${LDMOD} $* &>/dev/null || ERROR="Failed to load $1" return 1
+	${LDMOD} $* &>/dev/null
+	if [ $? -ne 0 ]; then
+		echo "Failed to load ${NAME} ($@)"
+		return 1
+	fi
 
 	return 0
 }
@@ -188,7 +218,7 @@ load_modules() {
 	mkdir -p /etc/zfs
 
 	for MOD in ${KERNEL_MODULES[*]}; do
-		load_module ${MOD}
+		load_module ${MOD} >/dev/null
 	done
 
 	for MOD in ${MODULES[*]}; do
@@ -260,34 +290,61 @@ check_loop_utils() {
 
 
 #
-# Find and return an unused loopback device.
+# Find and return an unused loop device.  A new /dev/loopN node will be
+# created if required.  The kernel loop driver will automatically register
+# the minor as long as it's less than /sys/module/loop/parameters/max_loop.
 #
 unused_loop_device() {
-	for DEVICE in `ls -1 /dev/loop* 2>/dev/null`; do
-		${LOSETUP} ${DEVICE} &>/dev/null
-		if [ $? -ne 0 ]; then
-			echo ${DEVICE}
-			return
-		fi
-	done
+	local DEVICE=$(${LOSETUP} -f)
+	local MAX_LOOP_PATH="/sys/module/loop/parameters/max_loop"
+	local MAX_LOOP;
 
-	die "Error: Unable to find unused loopback device"
+	# An existing /dev/loopN device was available.
+	if [ -n "${DEVICE}" ]; then
+		echo "${DEVICE}"
+		return 0
+	fi
+
+	# Create a new /dev/loopN provided we are not at MAX_LOOP.
+	if [ -f "${MAX_LOOP_PATH}" ]; then
+		MAX_LOOP=`cat /sys/module/loop/parameters/max_loop`
+		if [ ${MAX_LOOP} -eq 0 ]; then
+			MAX_LOOP=255
+		fi
+
+		for (( i=0; i<=${MAX_LOOP}; i++ )); do
+			DEVICE="/dev/loop$i"
+
+			if [ -b "${DEVICE}" ]; then
+				continue
+			else
+				mknod -m660 "${DEVICE}" b 7 $i
+				chown root.disk "${DEVICE}"
+				chmod 666 "${DEVICE}"
+
+				echo "${DEVICE}"
+				return 0
+			fi
+		done
+	fi
+
+	die "Error: Unable to create new loopback device"
 }
 
 #
 # This can be slightly dangerous because the loop devices we are
 # cleaning up may not be ours.  However, if the devices are currently
 # in use we will not be able to remove them, and we only remove
-# devices which include 'zpool' in the name.  So any damage we might
-# do should be limited to other zfs related testing.
+# devices which include 'zpool' or 'deleted' in the name.  So any
+# damage we might do should be limited to other zfs related testing.
 #
 cleanup_loop_devices() {
 	local TMP_FILE=`mktemp`
 
 	${LOSETUP} -a | tr -d '()' >${TMP_FILE}
 	${AWK} -F":" -v losetup="$LOSETUP" \
-	    '/zpool/ { system("losetup -d "$1) }' ${TMP_FILE}
-	${AWK} -F" " '/zpool/ { system("rm -f "$3) }' ${TMP_FILE}
+	    '/zpool/ || /deleted/ { system("losetup -d "$1) }' ${TMP_FILE}
+	${AWK} -F" " '/zpool/ || /deleted/ { system("rm -f "$3) }' ${TMP_FILE}
 
 	rm -f ${TMP_FILE}
 }
@@ -300,7 +357,7 @@ destroy_loop_devices() {
 	local LODEVICES="$1"
 
 	msg "Destroying ${LODEVICES}"
-	 ${LOSETUP} -d ${LODEVICES} || \
+	${LOSETUP} -d ${LODEVICES} || \
 		die "Error $? destroying ${FILE} -> ${DEVICE} loopback"
 
 	rm -f ${FILES}
@@ -308,13 +365,14 @@ destroy_loop_devices() {
 }
 
 #
-# Create a device label.
+# Create a device label taking care to briefly wait if udev needs to settle.
 #
 label() {
 	local DEVICE=$1
 	local LABEL=$2
 
-	${PARTED} ${DEVICE} --script -- mklabel ${LABEL} || return 1
+	wait_udev ${DEVICE} 30 || return 1
+	${PARTED} ${DEVICE} --script -- mklabel ${LABEL} || return 2
 
 	return 0
 }
@@ -342,7 +400,9 @@ format() {
 	local DEVICE=$1
 	local FSTYPE=$2
 
-	/sbin/mkfs.${FSTYPE} -q ${DEVICE} || return 1
+	# Force 4K blocksize, else mkfs.ext2 tries to use 8K, which
+	# won't mount
+	/sbin/mkfs.${FSTYPE} -b 4096 -F -q ${DEVICE} >/dev/null || return 1
 
 	return 0
 }
@@ -496,7 +556,7 @@ udev_trigger() {
 
 #
 # The following udev helper functions assume that the provided
-# udev rules file will create a /dev/disk/zpool/<CHANNEL><RANK>
+# udev rules file will create a /dev/disk/by-vdev/<CHANNEL><RANK>
 # disk mapping.  In this mapping each CHANNEL is represented by
 # the letters a-z, and the RANK is represented by the numbers
 # 1-n.  A CHANNEL should identify a group of RANKS which are all
@@ -716,4 +776,10 @@ stack_check() {
 			cat $STACK_TRACE
 		fi
 	fi
+}
+
+kill_zed() {
+        if [ -f $ZED_PIDFILE ]; then
+		kill $(cat $ZED_PIDFILE)
+        fi
 }

@@ -20,6 +20,8 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 Cyril Plisko. All rights reserved.
+ * Copyright (c) 2013 by Delphix. All rights reserved.
  */
 
 #include <sys/types.h>
@@ -72,7 +74,7 @@ zfs_init_vattr(vattr_t *vap, uint64_t mask, uint64_t mode,
 static int
 zfs_replay_error(zfs_sb_t *zsb, lr_t *lr, boolean_t byteswap)
 {
-	return (ENOTSUP);
+	return (SET_ERROR(ENOTSUP));
 }
 
 static void
@@ -277,6 +279,8 @@ zfs_replay_create_acl(zfs_sb_t *zsb, lr_acl_create_t *lracl, boolean_t byteswap)
 	void *fuidstart;
 	size_t xvatlen = 0;
 	uint64_t txtype;
+	uint64_t objid;
+	uint64_t dnodesize;
 	int error;
 
 	txtype = (lr->lr_common.lrc_txtype & ~TX_CI);
@@ -302,19 +306,24 @@ zfs_replay_create_acl(zfs_sb_t *zsb, lr_acl_create_t *lracl, boolean_t byteswap)
 	if ((error = zfs_zget(zsb, lr->lr_doid, &dzp)) != 0)
 		return (error);
 
+	objid = LR_FOID_GET_OBJ(lr->lr_foid);
+	dnodesize = LR_FOID_GET_SLOTS(lr->lr_foid) << DNODE_SHIFT;
+
 	xva_init(&xva);
 	zfs_init_vattr(&xva.xva_vattr, ATTR_MODE | ATTR_UID | ATTR_GID,
-	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, lr->lr_foid);
+	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, objid);
 
 	/*
 	 * All forms of zfs create (create, mkdir, mkxattrdir, symlink)
 	 * eventually end up in zfs_mknode(), which assigns the object's
-	 * creation time and generation number.  The generic zfs_create()
-	 * doesn't have either concept, so we smuggle the values inside
-	 * the vattr's otherwise unused va_ctime and va_nblocks fields.
+	 * creation time, generation number, and dnode size. The generic
+	 * zfs_create() has no concept of these attributes, so we smuggle
+	 * the values inside the vattr's otherwise unused va_ctime,
+	 * va_nblocks, and va_fsid fields.
 	 */
 	ZFS_TIME_DECODE(&xva.xva_vattr.va_ctime, lr->lr_crtime);
 	xva.xva_vattr.va_nblocks = lr->lr_gen;
+	xva.xva_vattr.va_fsid = dnodesize;
 
 	error = dmu_object_info(zsb->z_os, lr->lr_foid, NULL);
 	if (error != ENOENT)
@@ -386,7 +395,7 @@ zfs_replay_create_acl(zfs_sb_t *zsb, lr_acl_create_t *lracl, boolean_t byteswap)
 		    &ip, kcred, vflg, &vsec);
 		break;
 	default:
-		error = ENOTSUP;
+		error = SET_ERROR(ENOTSUP);
 	}
 
 bail:
@@ -416,6 +425,8 @@ zfs_replay_create(zfs_sb_t *zsb, lr_create_t *lr, boolean_t byteswap)
 	void *start;
 	size_t xvatlen;
 	uint64_t txtype;
+	uint64_t objid;
+	uint64_t dnodesize;
 	int error;
 
 	txtype = (lr->lr_common.lrc_txtype & ~TX_CI);
@@ -429,21 +440,26 @@ zfs_replay_create(zfs_sb_t *zsb, lr_create_t *lr, boolean_t byteswap)
 	if ((error = zfs_zget(zsb, lr->lr_doid, &dzp)) != 0)
 		return (error);
 
+	objid = LR_FOID_GET_OBJ(lr->lr_foid);
+	dnodesize = LR_FOID_GET_SLOTS(lr->lr_foid) << DNODE_SHIFT;
+
 	xva_init(&xva);
 	zfs_init_vattr(&xva.xva_vattr, ATTR_MODE | ATTR_UID | ATTR_GID,
-	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, lr->lr_foid);
+	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, objid);
 
 	/*
 	 * All forms of zfs create (create, mkdir, mkxattrdir, symlink)
 	 * eventually end up in zfs_mknode(), which assigns the object's
-	 * creation time and generation number.  The generic zfs_create()
-	 * doesn't have either concept, so we smuggle the values inside
-	 * the vattr's otherwise unused va_ctime and va_nblocks fields.
+	 * creation time, generation number, and dnode slot count. The
+	 * generic zfs_create() has no concept of these attributes, so
+	 * we smuggle the values inside * the vattr's otherwise unused
+	 * va_ctime, va_nblocks, and va_nlink fields.
 	 */
 	ZFS_TIME_DECODE(&xva.xva_vattr.va_ctime, lr->lr_crtime);
 	xva.xva_vattr.va_nblocks = lr->lr_gen;
+	xva.xva_vattr.va_fsid = dnodesize;
 
-	error = dmu_object_info(zsb->z_os, lr->lr_foid, NULL);
+	error = dmu_object_info(zsb->z_os, objid, NULL);
 	if (error != ENOENT)
 		goto out;
 
@@ -512,7 +528,7 @@ zfs_replay_create(zfs_sb_t *zsb, lr_create_t *lr, boolean_t byteswap)
 		    link, &ip, kcred, vflg);
 		break;
 	default:
-		error = ENOTSUP;
+		error = SET_ERROR(ENOTSUP);
 	}
 
 out:
@@ -546,13 +562,13 @@ zfs_replay_remove(zfs_sb_t *zsb, lr_remove_t *lr, boolean_t byteswap)
 
 	switch ((int)lr->lr_common.lrc_txtype) {
 	case TX_REMOVE:
-		error = zfs_remove(ZTOI(dzp), name, kcred);
+		error = zfs_remove(ZTOI(dzp), name, kcred, vflg);
 		break;
 	case TX_RMDIR:
 		error = zfs_rmdir(ZTOI(dzp), name, NULL, kcred, vflg);
 		break;
 	default:
-		error = ENOTSUP;
+		error = SET_ERROR(ENOTSUP);
 	}
 
 	iput(ZTOI(dzp));
@@ -582,7 +598,7 @@ zfs_replay_link(zfs_sb_t *zsb, lr_link_t *lr, boolean_t byteswap)
 	if (lr->lr_common.lrc_txtype & TX_CI)
 		vflg |= FIGNORECASE;
 
-	error = zfs_link(ZTOI(dzp), ZTOI(zp), name, kcred);
+	error = zfs_link(ZTOI(dzp), ZTOI(zp), name, kcred, vflg);
 
 	iput(ZTOI(zp));
 	iput(ZTOI(dzp));
@@ -626,7 +642,7 @@ zfs_replay_write(zfs_sb_t *zsb, lr_write_t *lr, boolean_t byteswap)
 {
 	char *data = (char *)(lr + 1);	/* data follows lr_write_t */
 	znode_t	*zp;
-	int error;
+	int error, written;
 	uint64_t eod, offset, length;
 
 	if (byteswap)
@@ -671,14 +687,12 @@ zfs_replay_write(zfs_sb_t *zsb, lr_write_t *lr, boolean_t byteswap)
 			zsb->z_replay_eof = eod;
 	}
 
-	error = zpl_write_common(ZTOI(zp), data, length, offset,
+	written = zpl_write_common(ZTOI(zp), data, length, &offset,
 	    UIO_SYSSPACE, 0, kcred);
-	if (error) {
-		if (error < 0)
-			error = -error;
-		else
-			error = EIO; /* Short write */
-	}
+	if (written < 0)
+		error = -written;
+	else if (written < length)
+		error = SET_ERROR(EIO); /* short write */
 
 	iput(ZTOI(zp));
 	zsb->z_replay_eof = 0;	/* safety */
@@ -911,26 +925,26 @@ zfs_replay_acl(zfs_sb_t *zsb, lr_acl_t *lr, boolean_t byteswap)
 /*
  * Callback vectors for replaying records
  */
-zil_replay_func_t *zfs_replay_vector[TX_MAX_TYPE] = {
-	(zil_replay_func_t *)zfs_replay_error,		/* no such type */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_CREATE */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_MKDIR */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_MKXATTR */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_SYMLINK */
-	(zil_replay_func_t *)zfs_replay_remove,		/* TX_REMOVE */
-	(zil_replay_func_t *)zfs_replay_remove,		/* TX_RMDIR */
-	(zil_replay_func_t *)zfs_replay_link,		/* TX_LINK */
-	(zil_replay_func_t *)zfs_replay_rename,		/* TX_RENAME */
-	(zil_replay_func_t *)zfs_replay_write,		/* TX_WRITE */
-	(zil_replay_func_t *)zfs_replay_truncate,	/* TX_TRUNCATE */
-	(zil_replay_func_t *)zfs_replay_setattr,	/* TX_SETATTR */
-	(zil_replay_func_t *)zfs_replay_acl_v0,		/* TX_ACL_V0 */
-	(zil_replay_func_t *)zfs_replay_acl,		/* TX_ACL */
-	(zil_replay_func_t *)zfs_replay_create_acl,	/* TX_CREATE_ACL */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_CREATE_ATTR */
-	(zil_replay_func_t *)zfs_replay_create_acl,	/* TX_CREATE_ACL_ATTR */
-	(zil_replay_func_t *)zfs_replay_create_acl,	/* TX_MKDIR_ACL */
-	(zil_replay_func_t *)zfs_replay_create,		/* TX_MKDIR_ATTR */
-	(zil_replay_func_t *)zfs_replay_create_acl,	/* TX_MKDIR_ACL_ATTR */
-	(zil_replay_func_t *)zfs_replay_write2,		/* TX_WRITE2 */
+zil_replay_func_t zfs_replay_vector[TX_MAX_TYPE] = {
+	(zil_replay_func_t)zfs_replay_error,		/* no such type */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_CREATE */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_MKDIR */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_MKXATTR */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_SYMLINK */
+	(zil_replay_func_t)zfs_replay_remove,		/* TX_REMOVE */
+	(zil_replay_func_t)zfs_replay_remove,		/* TX_RMDIR */
+	(zil_replay_func_t)zfs_replay_link,		/* TX_LINK */
+	(zil_replay_func_t)zfs_replay_rename,		/* TX_RENAME */
+	(zil_replay_func_t)zfs_replay_write,		/* TX_WRITE */
+	(zil_replay_func_t)zfs_replay_truncate,		/* TX_TRUNCATE */
+	(zil_replay_func_t)zfs_replay_setattr,		/* TX_SETATTR */
+	(zil_replay_func_t)zfs_replay_acl_v0,		/* TX_ACL_V0 */
+	(zil_replay_func_t)zfs_replay_acl,		/* TX_ACL */
+	(zil_replay_func_t)zfs_replay_create_acl,	/* TX_CREATE_ACL */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_CREATE_ATTR */
+	(zil_replay_func_t)zfs_replay_create_acl,	/* TX_CREATE_ACL_ATTR */
+	(zil_replay_func_t)zfs_replay_create_acl,	/* TX_MKDIR_ACL */
+	(zil_replay_func_t)zfs_replay_create,		/* TX_MKDIR_ATTR */
+	(zil_replay_func_t)zfs_replay_create_acl,	/* TX_MKDIR_ACL_ATTR */
+	(zil_replay_func_t)zfs_replay_write2,		/* TX_WRITE2 */
 };

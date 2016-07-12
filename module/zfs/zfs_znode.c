@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 /* Portions Copyright 2007 Jeremy Teo */
@@ -60,6 +61,8 @@
 #endif /* _KERNEL */
 
 #include <sys/dmu.h>
+#include <sys/dmu_objset.h>
+#include <sys/dmu_tx.h>
 #include <sys/refcount.h>
 #include <sys/stat.h>
 #include <sys/zap.h>
@@ -93,6 +96,8 @@
 #ifdef _KERNEL
 
 static kmem_cache_t *znode_cache = NULL;
+static kmem_cache_t *znode_hold_cache = NULL;
+unsigned int zfs_object_mutex_size = ZFS_OBJ_MTX_SZ;
 
 /*ARGSUSED*/
 static int
@@ -105,17 +110,16 @@ zfs_znode_cache_constructor(void *buf, void *arg, int kmflags)
 
 	mutex_init(&zp->z_lock, NULL, MUTEX_DEFAULT, NULL);
 	rw_init(&zp->z_parent_lock, NULL, RW_DEFAULT, NULL);
-	rw_init(&zp->z_name_lock, NULL, RW_DEFAULT, NULL);
+	rw_init(&zp->z_name_lock, NULL, RW_NOLOCKDEP, NULL);
 	mutex_init(&zp->z_acl_lock, NULL, MUTEX_DEFAULT, NULL);
 	rw_init(&zp->z_xattr_lock, NULL, RW_DEFAULT, NULL);
 
-	mutex_init(&zp->z_range_lock, NULL, MUTEX_DEFAULT, NULL);
-	avl_create(&zp->z_range_avl, zfs_range_compare,
-	    sizeof (rl_t), offsetof(rl_t, r_node));
+	zfs_rlock_init(&zp->z_range_lock);
 
 	zp->z_dirlocks = NULL;
 	zp->z_acl_cached = NULL;
 	zp->z_xattr_cached = NULL;
+	zp->z_xattr_parent = NULL;
 	zp->z_moved = 0;
 	return (0);
 }
@@ -132,24 +136,52 @@ zfs_znode_cache_destructor(void *buf, void *arg)
 	rw_destroy(&zp->z_name_lock);
 	mutex_destroy(&zp->z_acl_lock);
 	rw_destroy(&zp->z_xattr_lock);
-	avl_destroy(&zp->z_range_avl);
-	mutex_destroy(&zp->z_range_lock);
+	zfs_rlock_destroy(&zp->z_range_lock);
 
 	ASSERT(zp->z_dirlocks == NULL);
 	ASSERT(zp->z_acl_cached == NULL);
 	ASSERT(zp->z_xattr_cached == NULL);
+	ASSERT(zp->z_xattr_parent == NULL);
+}
+
+static int
+zfs_znode_hold_cache_constructor(void *buf, void *arg, int kmflags)
+{
+	znode_hold_t *zh = buf;
+
+	mutex_init(&zh->zh_lock, NULL, MUTEX_DEFAULT, NULL);
+	refcount_create(&zh->zh_refcount);
+	zh->zh_obj = ZFS_NO_OBJECT;
+
+	return (0);
+}
+
+static void
+zfs_znode_hold_cache_destructor(void *buf, void *arg)
+{
+	znode_hold_t *zh = buf;
+
+	mutex_destroy(&zh->zh_lock);
+	refcount_destroy(&zh->zh_refcount);
 }
 
 void
 zfs_znode_init(void)
 {
 	/*
-	 * Initialize zcache
+	 * Initialize zcache.  The KMC_SLAB hint is used in order that it be
+	 * backed by kmalloc() when on the Linux slab in order that any
+	 * wait_on_bit() operations on the related inode operate properly.
 	 */
 	ASSERT(znode_cache == NULL);
 	znode_cache = kmem_cache_create("zfs_znode_cache",
 	    sizeof (znode_t), 0, zfs_znode_cache_constructor,
-	    zfs_znode_cache_destructor, NULL, NULL, NULL, KMC_KMEM);
+	    zfs_znode_cache_destructor, NULL, NULL, NULL, KMC_SLAB);
+
+	ASSERT(znode_hold_cache == NULL);
+	znode_hold_cache = kmem_cache_create("zfs_znode_hold_cache",
+	    sizeof (znode_hold_t), 0, zfs_znode_hold_cache_constructor,
+	    zfs_znode_hold_cache_destructor, NULL, NULL, NULL, 0);
 }
 
 void
@@ -161,6 +193,123 @@ zfs_znode_fini(void)
 	if (znode_cache)
 		kmem_cache_destroy(znode_cache);
 	znode_cache = NULL;
+
+	if (znode_hold_cache)
+		kmem_cache_destroy(znode_hold_cache);
+	znode_hold_cache = NULL;
+}
+
+/*
+ * The zfs_znode_hold_enter() / zfs_znode_hold_exit() functions are used to
+ * serialize access to a znode and its SA buffer while the object is being
+ * created or destroyed.  This kind of locking would normally reside in the
+ * znode itself but in this case that's impossible because the znode and SA
+ * buffer may not yet exist.  Therefore the locking is handled externally
+ * with an array of mutexs and AVLs trees which contain per-object locks.
+ *
+ * In zfs_znode_hold_enter() a per-object lock is created as needed, inserted
+ * in to the correct AVL tree and finally the per-object lock is held.  In
+ * zfs_znode_hold_exit() the process is reversed.  The per-object lock is
+ * released, removed from the AVL tree and destroyed if there are no waiters.
+ *
+ * This scheme has two important properties:
+ *
+ * 1) No memory allocations are performed while holding one of the z_hold_locks.
+ *    This ensures evict(), which can be called from direct memory reclaim, will
+ *    never block waiting on a z_hold_locks which just happens to have hashed
+ *    to the same index.
+ *
+ * 2) All locks used to serialize access to an object are per-object and never
+ *    shared.  This minimizes lock contention without creating a large number
+ *    of dedicated locks.
+ *
+ * On the downside it does require znode_lock_t structures to be frequently
+ * allocated and freed.  However, because these are backed by a kmem cache
+ * and very short lived this cost is minimal.
+ */
+int
+zfs_znode_hold_compare(const void *a, const void *b)
+{
+	const znode_hold_t *zh_a = a;
+	const znode_hold_t *zh_b = b;
+
+	if (zh_a->zh_obj < zh_b->zh_obj)
+		return (-1);
+	else if (zh_a->zh_obj > zh_b->zh_obj)
+		return (1);
+	else
+		return (0);
+}
+
+boolean_t
+zfs_znode_held(zfs_sb_t *zsb, uint64_t obj)
+{
+	znode_hold_t *zh, search;
+	int i = ZFS_OBJ_HASH(zsb, obj);
+	boolean_t held;
+
+	search.zh_obj = obj;
+
+	mutex_enter(&zsb->z_hold_locks[i]);
+	zh = avl_find(&zsb->z_hold_trees[i], &search, NULL);
+	held = (zh && MUTEX_HELD(&zh->zh_lock)) ? B_TRUE : B_FALSE;
+	mutex_exit(&zsb->z_hold_locks[i]);
+
+	return (held);
+}
+
+static znode_hold_t *
+zfs_znode_hold_enter(zfs_sb_t *zsb, uint64_t obj)
+{
+	znode_hold_t *zh, *zh_new, search;
+	int i = ZFS_OBJ_HASH(zsb, obj);
+	boolean_t found = B_FALSE;
+
+	zh_new = kmem_cache_alloc(znode_hold_cache, KM_SLEEP);
+	zh_new->zh_obj = obj;
+	search.zh_obj = obj;
+
+	mutex_enter(&zsb->z_hold_locks[i]);
+	zh = avl_find(&zsb->z_hold_trees[i], &search, NULL);
+	if (likely(zh == NULL)) {
+		zh = zh_new;
+		avl_add(&zsb->z_hold_trees[i], zh);
+	} else {
+		ASSERT3U(zh->zh_obj, ==, obj);
+		found = B_TRUE;
+	}
+	refcount_add(&zh->zh_refcount, NULL);
+	mutex_exit(&zsb->z_hold_locks[i]);
+
+	if (found == B_TRUE)
+		kmem_cache_free(znode_hold_cache, zh_new);
+
+	ASSERT(MUTEX_NOT_HELD(&zh->zh_lock));
+	ASSERT3S(refcount_count(&zh->zh_refcount), >, 0);
+	mutex_enter(&zh->zh_lock);
+
+	return (zh);
+}
+
+static void
+zfs_znode_hold_exit(zfs_sb_t *zsb, znode_hold_t *zh)
+{
+	int i = ZFS_OBJ_HASH(zsb, zh->zh_obj);
+	boolean_t remove = B_FALSE;
+
+	ASSERT(zfs_znode_held(zsb, zh->zh_obj));
+	ASSERT3S(refcount_count(&zh->zh_refcount), >, 0);
+	mutex_exit(&zh->zh_lock);
+
+	mutex_enter(&zsb->z_hold_locks[i]);
+	if (refcount_remove(&zh->zh_refcount, NULL) == 0) {
+		avl_remove(&zsb->z_hold_trees[i], zh);
+		remove = B_TRUE;
+	}
+	mutex_exit(&zsb->z_hold_locks[i]);
+
+	if (remove == B_TRUE)
+		kmem_cache_free(znode_hold_cache, zh);
 }
 
 int
@@ -179,7 +328,7 @@ zfs_create_share_dir(zfs_sb_t *zsb, dmu_tx_t *tx)
 	vattr.va_uid = crgetuid(kcred);
 	vattr.va_gid = crgetgid(kcred);
 
-	sharezp = kmem_cache_alloc(znode_cache, KM_PUSHPAGE);
+	sharezp = kmem_cache_alloc(znode_cache, KM_SLEEP);
 	sharezp->z_moved = 0;
 	sharezp->z_unlinked = 0;
 	sharezp->z_atime_dirty = 0;
@@ -215,7 +364,7 @@ static void
 zfs_znode_sa_init(zfs_sb_t *zsb, znode_t *zp,
     dmu_buf_t *db, dmu_object_type_t obj_type, sa_handle_t *sa_hdl)
 {
-	ASSERT(MUTEX_HELD(ZFS_OBJ_MUTEX(zsb, zp->z_id)));
+	ASSERT(zfs_znode_held(zsb, zp->z_id));
 
 	mutex_enter(&zp->z_lock);
 
@@ -237,8 +386,7 @@ zfs_znode_sa_init(zfs_sb_t *zsb, znode_t *zp,
 void
 zfs_znode_dmu_fini(znode_t *zp)
 {
-	ASSERT(MUTEX_HELD(ZFS_OBJ_MUTEX(ZTOZSB(zp), zp->z_id)) ||
-	    zp->z_unlinked ||
+	ASSERT(zfs_znode_held(ZTOZSB(zp), zp->z_id) || zp->z_unlinked ||
 	    RW_WRITE_HELD(&ZTOZSB(zp)->z_teardown_inactive_lock));
 
 	sa_handle_destroy(zp->z_sa_hdl);
@@ -253,7 +401,7 @@ zfs_inode_alloc(struct super_block *sb, struct inode **ip)
 {
 	znode_t *zp;
 
-	zp = kmem_cache_alloc(znode_cache, KM_PUSHPAGE);
+	zp = kmem_cache_alloc(znode_cache, KM_SLEEP);
 	*ip = ZTOI(zp);
 
 	return (0);
@@ -268,12 +416,11 @@ zfs_inode_destroy(struct inode *ip)
 	znode_t *zp = ITOZ(ip);
 	zfs_sb_t *zsb = ZTOZSB(zp);
 
-	if (zfsctl_is_node(ip))
-		zfsctl_inode_destroy(ip);
-
 	mutex_enter(&zsb->z_znodes_lock);
-	list_remove(&zsb->z_all_znodes, zp);
-	zsb->z_nr_znodes--;
+	if (list_link_active(&zp->z_link_node)) {
+		list_remove(&zsb->z_all_znodes, zp);
+		zsb->z_nr_znodes--;
+	}
 	mutex_exit(&zsb->z_znodes_lock);
 
 	if (zp->z_acl_cached) {
@@ -284,6 +431,11 @@ zfs_inode_destroy(struct inode *ip)
 	if (zp->z_xattr_cached) {
 		nvlist_free(zp->z_xattr_cached);
 		zp->z_xattr_cached = NULL;
+	}
+
+	if (zp->z_xattr_parent) {
+		zfs_iput_async(ZTOI(zp->z_xattr_parent));
+		zp->z_xattr_parent = NULL;
 	}
 
 	kmem_cache_free(znode_cache, zp);
@@ -316,8 +468,8 @@ zfs_inode_set_ops(zfs_sb_t *zsb, struct inode *ip)
 	 */
 	case S_IFCHR:
 	case S_IFBLK:
-		VERIFY(sa_lookup(ITOZ(ip)->z_sa_hdl, SA_ZPL_RDEV(zsb),
-		    &rdev, sizeof (rdev)) == 0);
+		sa_lookup(ITOZ(ip)->z_sa_hdl, SA_ZPL_RDEV(zsb), &rdev,
+		    sizeof (rdev));
 		/*FALLTHROUGH*/
 	case S_IFIFO:
 	case S_IFSOCK:
@@ -326,101 +478,35 @@ zfs_inode_set_ops(zfs_sb_t *zsb, struct inode *ip)
 		break;
 
 	default:
-		printk("ZFS: Invalid mode: 0x%x\n", ip->i_mode);
-		VERIFY(0);
+		zfs_panic_recover("inode %llu has invalid mode: 0x%x\n",
+		    (u_longlong_t)ip->i_ino, ip->i_mode);
+
+		/* Assume the inode is a file and attempt to continue */
+		ip->i_mode = S_IFREG | 0644;
+		ip->i_op = &zpl_inode_operations;
+		ip->i_fop = &zpl_file_operations;
+		ip->i_mapping->a_ops = &zpl_address_space_operations;
+		break;
 	}
 }
 
-/*
- * Construct a znode+inode and initialize.
- *
- * This does not do a call to dmu_set_user() that is
- * up to the caller to do, in case you don't want to
- * return the znode
- */
-static znode_t *
-zfs_znode_alloc(zfs_sb_t *zsb, dmu_buf_t *db, int blksz,
-    dmu_object_type_t obj_type, uint64_t obj, sa_handle_t *hdl,
-    struct dentry *dentry, struct inode *dip)
+void
+zfs_set_inode_flags(znode_t *zp, struct inode *ip)
 {
-	znode_t	*zp;
-	struct inode *ip;
-	uint64_t parent;
-	sa_bulk_attr_t bulk[9];
-	int count = 0;
+	/*
+	 * Linux and Solaris have different sets of file attributes, so we
+	 * restrict this conversion to the intersection of the two.
+	 */
 
-	ASSERT(zsb != NULL);
+	if (zp->z_pflags & ZFS_IMMUTABLE)
+		ip->i_flags |= S_IMMUTABLE;
+	else
+		ip->i_flags &= ~S_IMMUTABLE;
 
-	ip = new_inode(zsb->z_sb);
-	if (ip == NULL)
-		return (NULL);
-
-	zp = ITOZ(ip);
-	ASSERT(zp->z_dirlocks == NULL);
-	ASSERT3P(zp->z_acl_cached, ==, NULL);
-	ASSERT3P(zp->z_xattr_cached, ==, NULL);
-	zp->z_moved = 0;
-	zp->z_sa_hdl = NULL;
-	zp->z_unlinked = 0;
-	zp->z_atime_dirty = 0;
-	zp->z_mapcnt = 0;
-	zp->z_id = db->db_object;
-	zp->z_blksz = blksz;
-	zp->z_seq = 0x7A4653;
-	zp->z_sync_cnt = 0;
-	zp->z_is_zvol = B_FALSE;
-	zp->z_is_mapped = B_FALSE;
-	zp->z_is_ctldir = B_FALSE;
-
-	zfs_znode_sa_init(zsb, zp, db, obj_type, hdl);
-
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MODE(zsb), NULL, &zp->z_mode, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GEN(zsb), NULL, &zp->z_gen, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_SIZE(zsb), NULL, &zp->z_size, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_LINKS(zsb), NULL, &zp->z_links, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_FLAGS(zsb), NULL,
-	    &zp->z_pflags, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_PARENT(zsb), NULL,
-	    &parent, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zsb), NULL,
-	    &zp->z_atime, 16);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zsb), NULL, &zp->z_uid, 8);
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zsb), NULL, &zp->z_gid, 8);
-
-	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count) != 0 || zp->z_gen == 0) {
-		if (hdl == NULL)
-			sa_handle_destroy(zp->z_sa_hdl);
-
-		goto error;
-	}
-
-	ip->i_ino = obj;
-	zfs_inode_update(zp);
-	zfs_inode_set_ops(zsb, ip);
-
-	if (insert_inode_locked(ip))
-		goto error;
-
-	if (dentry) {
-		if (zpl_xattr_security_init(ip, dip, &dentry->d_name))
-			goto error;
-
-		d_instantiate(dentry, ip);
-	}
-
-	mutex_enter(&zsb->z_znodes_lock);
-	list_insert_tail(&zsb->z_all_znodes, zp);
-	zsb->z_nr_znodes++;
-	membar_producer();
-	mutex_exit(&zsb->z_znodes_lock);
-
-	unlock_new_inode(ip);
-	return (zp);
-
-error:
-	unlock_new_inode(ip);
-	iput(ip);
-	return NULL;
+	if (zp->z_pflags & ZFS_APPENDONLY)
+		ip->i_flags |= S_APPEND;
+	else
+		ip->i_flags &= ~S_APPEND;
 }
 
 /*
@@ -430,12 +516,13 @@ error:
  * inode has the correct field it should be used, and the ZFS code
  * updated to access the inode.  This can be done incrementally.
  */
-void
-zfs_inode_update(znode_t *zp)
+static void
+zfs_inode_update_impl(znode_t *zp, boolean_t new)
 {
 	zfs_sb_t	*zsb;
 	struct inode	*ip;
 	uint32_t	blksize;
+	u_longlong_t	i_blocks;
 	uint64_t	atime[2], mtime[2], ctime[2];
 
 	ASSERT(zp != NULL);
@@ -450,22 +537,163 @@ zfs_inode_update(znode_t *zp)
 	sa_lookup(zp->z_sa_hdl, SA_ZPL_MTIME(zsb), &mtime, 16);
 	sa_lookup(zp->z_sa_hdl, SA_ZPL_CTIME(zsb), &ctime, 16);
 
+	dmu_object_size_from_db(sa_get_db(zp->z_sa_hdl), &blksize, &i_blocks);
+
 	spin_lock(&ip->i_lock);
-	ip->i_generation = zp->z_gen;
-	ip->i_uid = zp->z_uid;
-	ip->i_gid = zp->z_gid;
+	ip->i_uid = SUID_TO_KUID(zp->z_uid);
+	ip->i_gid = SGID_TO_KGID(zp->z_gid);
 	set_nlink(ip, zp->z_links);
 	ip->i_mode = zp->z_mode;
+	zfs_set_inode_flags(zp, ip);
 	ip->i_blkbits = SPA_MINBLOCKSHIFT;
-	dmu_object_size_from_db(sa_get_db(zp->z_sa_hdl), &blksize,
-	    (u_longlong_t *)&ip->i_blocks);
+	ip->i_blocks = i_blocks;
 
-	ZFS_TIME_DECODE(&ip->i_atime, atime);
+	/*
+	 * Only read atime from SA if we are newly created inode (or rezget),
+	 * otherwise i_atime might be dirty.
+	 */
+	if (new)
+		ZFS_TIME_DECODE(&ip->i_atime, atime);
 	ZFS_TIME_DECODE(&ip->i_mtime, mtime);
 	ZFS_TIME_DECODE(&ip->i_ctime, ctime);
 
 	i_size_write(ip, zp->z_size);
 	spin_unlock(&ip->i_lock);
+}
+
+static void
+zfs_inode_update_new(znode_t *zp)
+{
+	zfs_inode_update_impl(zp, B_TRUE);
+}
+
+void
+zfs_inode_update(znode_t *zp)
+{
+	zfs_inode_update_impl(zp, B_FALSE);
+}
+
+/*
+ * Construct a znode+inode and initialize.
+ *
+ * This does not do a call to dmu_set_user() that is
+ * up to the caller to do, in case you don't want to
+ * return the znode
+ */
+static znode_t *
+zfs_znode_alloc(zfs_sb_t *zsb, dmu_buf_t *db, int blksz,
+    dmu_object_type_t obj_type, uint64_t obj, sa_handle_t *hdl,
+    struct inode *dip)
+{
+	znode_t	*zp;
+	struct inode *ip;
+	uint64_t mode;
+	uint64_t parent;
+	uint64_t tmp_gen;
+	sa_bulk_attr_t bulk[8];
+	int count = 0;
+
+	ASSERT(zsb != NULL);
+
+	ip = new_inode(zsb->z_sb);
+	if (ip == NULL)
+		return (NULL);
+
+	zp = ITOZ(ip);
+	ASSERT(zp->z_dirlocks == NULL);
+	ASSERT3P(zp->z_acl_cached, ==, NULL);
+	ASSERT3P(zp->z_xattr_cached, ==, NULL);
+	ASSERT3P(zp->z_xattr_parent, ==, NULL);
+	zp->z_moved = 0;
+	zp->z_sa_hdl = NULL;
+	zp->z_unlinked = 0;
+	zp->z_atime_dirty = 0;
+	zp->z_mapcnt = 0;
+	zp->z_id = db->db_object;
+	zp->z_blksz = blksz;
+	zp->z_seq = 0x7A4653;
+	zp->z_sync_cnt = 0;
+	zp->z_is_mapped = B_FALSE;
+	zp->z_is_ctldir = B_FALSE;
+	zp->z_is_stale = B_FALSE;
+	zp->z_range_lock.zr_size = &zp->z_size;
+	zp->z_range_lock.zr_blksz = &zp->z_blksz;
+	zp->z_range_lock.zr_max_blksz = &ZTOZSB(zp)->z_max_blksz;
+
+	zfs_znode_sa_init(zsb, zp, db, obj_type, hdl);
+
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MODE(zsb), NULL, &mode, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GEN(zsb), NULL, &tmp_gen, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_SIZE(zsb), NULL, &zp->z_size, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_LINKS(zsb), NULL, &zp->z_links, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_FLAGS(zsb), NULL,
+	    &zp->z_pflags, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_PARENT(zsb), NULL,
+	    &parent, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zsb), NULL, &zp->z_uid, 8);
+	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zsb), NULL, &zp->z_gid, 8);
+
+	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count) != 0 ||
+		tmp_gen == 0) {
+
+		if (hdl == NULL)
+			sa_handle_destroy(zp->z_sa_hdl);
+		zp->z_sa_hdl = NULL;
+		goto error;
+	}
+
+	zp->z_mode = mode;
+	ip->i_generation = (uint32_t)tmp_gen;
+
+	/*
+	 * xattr znodes hold a reference on their unique parent
+	 */
+	if (dip && zp->z_pflags & ZFS_XATTR) {
+		igrab(dip);
+		zp->z_xattr_parent = ITOZ(dip);
+	}
+
+	ip->i_ino = obj;
+	zfs_inode_update_new(zp);
+	zfs_inode_set_ops(zsb, ip);
+
+	/*
+	 * The only way insert_inode_locked() can fail is if the ip->i_ino
+	 * number is already hashed for this super block.  This can never
+	 * happen because the inode numbers map 1:1 with the object numbers.
+	 *
+	 * The one exception is rolling back a mounted file system, but in
+	 * this case all the active inode are unhashed during the rollback.
+	 */
+	VERIFY3S(insert_inode_locked(ip), ==, 0);
+
+	mutex_enter(&zsb->z_znodes_lock);
+	list_insert_tail(&zsb->z_all_znodes, zp);
+	zsb->z_nr_znodes++;
+	membar_producer();
+	mutex_exit(&zsb->z_znodes_lock);
+
+	unlock_new_inode(ip);
+	return (zp);
+
+error:
+	iput(ip);
+	return (NULL);
+}
+
+/*
+ * Safely mark an inode dirty.  Inodes which are part of a read-only
+ * file system or snapshot may not be dirtied.
+ */
+void
+zfs_mark_inode_dirty(struct inode *ip)
+{
+	zfs_sb_t *zsb = ITOZSB(ip);
+
+	if (zfs_is_readonly(zsb) || dmu_objset_is_snapshot(zsb->z_os))
+		return;
+
+	mark_inode_dirty(ip);
 }
 
 static uint64_t empty_xattr;
@@ -500,27 +728,34 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	dmu_buf_t	*db;
 	timestruc_t	now;
 	uint64_t	gen, obj;
-	int		err;
 	int		bonuslen;
+	int		dnodesize;
 	sa_handle_t	*sa_hdl;
 	dmu_object_type_t obj_type;
 	sa_bulk_attr_t	*sa_attrs;
 	int		cnt = 0;
 	zfs_acl_locator_cb_t locate = { 0 };
+	znode_hold_t	*zh;
 
 	if (zsb->z_replay) {
 		obj = vap->va_nodeid;
 		now = vap->va_ctime;		/* see zfs_replay_create() */
 		gen = vap->va_nblocks;		/* ditto */
+		dnodesize = vap->va_fsid;	/* ditto */
 	} else {
 		obj = 0;
 		gethrestime(&now);
 		gen = dmu_tx_get_txg(tx);
+		dnodesize = dmu_objset_dnodesize(zsb->z_os);
 	}
 
+	if (dnodesize == 0)
+		dnodesize = DNODE_MIN_SIZE;
+
 	obj_type = zsb->z_use_sa ? DMU_OT_SA : DMU_OT_ZNODE;
+
 	bonuslen = (obj_type == DMU_OT_SA) ?
-	    DN_MAX_BONUSLEN : ZFS_OLD_ZNODE_PHYS_SIZE;
+	    DN_BONUS_SIZE(dnodesize) : ZFS_OLD_ZNODE_PHYS_SIZE;
 
 	/*
 	 * Create a new DMU object.
@@ -533,29 +768,27 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	 */
 	if (S_ISDIR(vap->va_mode)) {
 		if (zsb->z_replay) {
-			err = zap_create_claim_norm(zsb->z_os, obj,
+			VERIFY0(zap_create_claim_norm_dnsize(zsb->z_os, obj,
 			    zsb->z_norm, DMU_OT_DIRECTORY_CONTENTS,
-			    obj_type, bonuslen, tx);
-			ASSERT3U(err, ==, 0);
+			    obj_type, bonuslen, dnodesize, tx));
 		} else {
-			obj = zap_create_norm(zsb->z_os,
+			obj = zap_create_norm_dnsize(zsb->z_os,
 			    zsb->z_norm, DMU_OT_DIRECTORY_CONTENTS,
-			    obj_type, bonuslen, tx);
+			    obj_type, bonuslen, dnodesize, tx);
 		}
 	} else {
 		if (zsb->z_replay) {
-			err = dmu_object_claim(zsb->z_os, obj,
+			VERIFY0(dmu_object_claim_dnsize(zsb->z_os, obj,
 			    DMU_OT_PLAIN_FILE_CONTENTS, 0,
-			    obj_type, bonuslen, tx);
-			ASSERT3U(err, ==, 0);
+			    obj_type, bonuslen, dnodesize, tx));
 		} else {
-			obj = dmu_object_alloc(zsb->z_os,
+			obj = dmu_object_alloc_dnsize(zsb->z_os,
 			    DMU_OT_PLAIN_FILE_CONTENTS, 0,
-			    obj_type, bonuslen, tx);
+			    obj_type, bonuslen, dnodesize, tx);
 		}
 	}
 
-	ZFS_OBJ_HOLD_ENTER(zsb, obj);
+	zh = zfs_znode_hold_enter(zsb, obj);
 	VERIFY(0 == sa_buf_hold(zsb->z_os, obj, NULL, &db));
 
 	/*
@@ -627,7 +860,7 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 	 * order for  DMU_OT_ZNODE is critical since it needs to be constructed
 	 * in the old znode_phys_t format.  Don't change this ordering
 	 */
-	sa_attrs = kmem_alloc(sizeof(sa_bulk_attr_t) * ZPL_END, KM_SLEEP);
+	sa_attrs = kmem_alloc(sizeof (sa_bulk_attr_t) * ZPL_END, KM_SLEEP);
 
 	if (obj_type == DMU_OT_ZNODE) {
 		SA_ADD_BULK_ATTR(sa_attrs, cnt, SA_ZPL_ATIME(zsb),
@@ -708,9 +941,9 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 
 	if (!(flag & IS_ROOT_NODE)) {
 		*zpp = zfs_znode_alloc(zsb, db, 0, obj_type, obj, sa_hdl,
-		    vap->va_dentry, ZTOI(dzp));
-		ASSERT(*zpp != NULL);
-		ASSERT(dzp != NULL);
+		    ZTOI(dzp));
+		VERIFY(*zpp != NULL);
+		VERIFY(dzp != NULL);
 	} else {
 		/*
 		 * If we are creating the root node, the "parent" we
@@ -723,20 +956,19 @@ zfs_mknode(znode_t *dzp, vattr_t *vap, dmu_tx_t *tx, cred_t *cr,
 
 	(*zpp)->z_pflags = pflags;
 	(*zpp)->z_mode = mode;
+	(*zpp)->z_dnodesize = dnodesize;
 
 	if (obj_type == DMU_OT_ZNODE ||
 	    acl_ids->z_aclp->z_version < ZFS_ACL_VERSION_FUID) {
-		err = zfs_aclset_common(*zpp, acl_ids->z_aclp, cr, tx);
-		ASSERT3S(err, ==, 0);
+		VERIFY0(zfs_aclset_common(*zpp, acl_ids->z_aclp, cr, tx));
 	}
-	kmem_free(sa_attrs, sizeof(sa_bulk_attr_t) * ZPL_END);
-	ZFS_OBJ_HOLD_EXIT(zsb, obj);
+	kmem_free(sa_attrs, sizeof (sa_bulk_attr_t) * ZPL_END);
+	zfs_znode_hold_exit(zsb, zh);
 }
 
 /*
- * zfs_xvattr_set only updates the in-core attributes
- * it is assumed the caller will be doing an sa_bulk_update
- * to push the changes out
+ * Update in-core attributes.  It is assumed the caller will be doing an
+ * sa_bulk_update to push the changes out.
  */
 void
 zfs_xvattr_set(znode_t *zp, xvattr_t *xvap, dmu_tx_t *tx)
@@ -835,21 +1067,18 @@ zfs_zget(zfs_sb_t *zsb, uint64_t obj_num, znode_t **zpp)
 	dmu_object_info_t doi;
 	dmu_buf_t	*db;
 	znode_t		*zp;
+	znode_hold_t	*zh;
 	int err;
 	sa_handle_t	*hdl;
-	struct inode	*ip;
 
 	*zpp = NULL;
 
 again:
-	ip = ilookup(zsb->z_sb, obj_num);
-
-	ZFS_OBJ_HOLD_ENTER(zsb, obj_num);
+	zh = zfs_znode_hold_enter(zsb, obj_num);
 
 	err = sa_buf_hold(zsb->z_os, obj_num, NULL, &db);
 	if (err) {
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		iput(ip);
+		zfs_znode_hold_exit(zsb, zh);
 		return (err);
 	}
 
@@ -859,28 +1088,14 @@ again:
 	    (doi.doi_bonus_type == DMU_OT_ZNODE &&
 	    doi.doi_bonus_size < sizeof (znode_phys_t)))) {
 		sa_buf_rele(db, NULL);
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		iput(ip);
-		return (EINVAL);
+		zfs_znode_hold_exit(zsb, zh);
+		return (SET_ERROR(EINVAL));
 	}
 
 	hdl = dmu_buf_get_user(db);
 	if (hdl != NULL) {
-		if (ip == NULL) {
-			/*
-			 * ilookup returned NULL, which means
-			 * the znode is dying - but the SA handle isn't
-			 * quite dead yet, we need to drop any locks
-			 * we're holding, re-schedule the task and try again.
-			 */
-			sa_buf_rele(db, NULL);
-			ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-
-			schedule();
-			goto again;
-		}
-
 		zp = sa_get_userdata(hdl);
+
 
 		/*
 		 * Since "SA" does immediate eviction we
@@ -893,20 +1108,38 @@ again:
 		mutex_enter(&zp->z_lock);
 		ASSERT3U(zp->z_id, ==, obj_num);
 		if (zp->z_unlinked) {
-			err = ENOENT;
+			err = SET_ERROR(ENOENT);
 		} else {
-			igrab(ZTOI(zp));
+			/*
+			 * If igrab() returns NULL the VFS has independently
+			 * determined the inode should be evicted and has
+			 * called iput_final() to start the eviction process.
+			 * The SA handle is still valid but because the VFS
+			 * requires that the eviction succeed we must drop
+			 * our locks and references to allow the eviction to
+			 * complete.  The zfs_zget() may then be retried.
+			 *
+			 * This unlikely case could be optimized by registering
+			 * a sops->drop_inode() callback.  The callback would
+			 * need to detect the active SA hold thereby informing
+			 * the VFS that this inode should not be evicted.
+			 */
+			if (igrab(ZTOI(zp)) == NULL) {
+				mutex_exit(&zp->z_lock);
+				sa_buf_rele(db, NULL);
+				zfs_znode_hold_exit(zsb, zh);
+				/* inode might need this to finish evict */
+				cond_resched();
+				goto again;
+			}
 			*zpp = zp;
 			err = 0;
 		}
-		sa_buf_rele(db, NULL);
 		mutex_exit(&zp->z_lock);
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		iput(ip);
+		sa_buf_rele(db, NULL);
+		zfs_znode_hold_exit(zsb, zh);
 		return (err);
 	}
-
-	ASSERT3P(ip, ==, NULL);
 
 	/*
 	 * Not found create new znode/vnode but only if file exists.
@@ -919,13 +1152,13 @@ again:
 	 * bonus buffer.
 	 */
 	zp = zfs_znode_alloc(zsb, db, doi.doi_data_block_size,
-	    doi.doi_bonus_type, obj_num, NULL, NULL, NULL);
+	    doi.doi_bonus_type, obj_num, NULL, NULL);
 	if (zp == NULL) {
-		err = ENOENT;
+		err = SET_ERROR(ENOENT);
 	} else {
 		*zpp = zp;
 	}
-	ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
+	zfs_znode_hold_exit(zsb, zh);
 	return (err);
 }
 
@@ -937,24 +1170,47 @@ zfs_rezget(znode_t *zp)
 	dmu_buf_t *db;
 	uint64_t obj_num = zp->z_id;
 	uint64_t mode;
-	sa_bulk_attr_t bulk[8];
+	sa_bulk_attr_t bulk[7];
 	int err;
 	int count = 0;
 	uint64_t gen;
+	znode_hold_t *zh;
 
-	ZFS_OBJ_HOLD_ENTER(zsb, obj_num);
+	/*
+	 * skip ctldir, otherwise they will always get invalidated. This will
+	 * cause funny behaviour for the mounted snapdirs. Especially for
+	 * Linux >= 3.18, d_invalidate will detach the mountpoint and prevent
+	 * anyone automount it again as long as someone is still using the
+	 * detached mount.
+	 */
+	if (zp->z_is_ctldir)
+		return (0);
+
+	zh = zfs_znode_hold_enter(zsb, obj_num);
 
 	mutex_enter(&zp->z_acl_lock);
 	if (zp->z_acl_cached) {
 		zfs_acl_free(zp->z_acl_cached);
 		zp->z_acl_cached = NULL;
 	}
-
 	mutex_exit(&zp->z_acl_lock);
+
+	rw_enter(&zp->z_xattr_lock, RW_WRITER);
+	if (zp->z_xattr_cached) {
+		nvlist_free(zp->z_xattr_cached);
+		zp->z_xattr_cached = NULL;
+	}
+
+	if (zp->z_xattr_parent) {
+		zfs_iput_async(ZTOI(zp->z_xattr_parent));
+		zp->z_xattr_parent = NULL;
+	}
+	rw_exit(&zp->z_xattr_lock);
+
 	ASSERT(zp->z_sa_hdl == NULL);
 	err = sa_buf_hold(zsb->z_os, obj_num, NULL, &db);
 	if (err) {
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
+		zfs_znode_hold_exit(zsb, zh);
 		return (err);
 	}
 
@@ -964,8 +1220,8 @@ zfs_rezget(znode_t *zp)
 	    (doi.doi_bonus_type == DMU_OT_ZNODE &&
 	    doi.doi_bonus_size < sizeof (znode_phys_t)))) {
 		sa_buf_rele(db, NULL);
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		return (EINVAL);
+		zfs_znode_hold_exit(zsb, zh);
+		return (SET_ERROR(EINVAL));
 	}
 
 	zfs_znode_sa_init(zsb, zp, db, doi.doi_bonus_type, NULL);
@@ -979,8 +1235,6 @@ zfs_rezget(znode_t *zp)
 	    &zp->z_links, sizeof (zp->z_links));
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_FLAGS(zsb), NULL,
 	    &zp->z_pflags, sizeof (zp->z_pflags));
-	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_ATIME(zsb), NULL,
-	    &zp->z_atime, sizeof (zp->z_atime));
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_UID(zsb), NULL,
 	    &zp->z_uid, sizeof (zp->z_uid));
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_GID(zsb), NULL,
@@ -990,22 +1244,24 @@ zfs_rezget(znode_t *zp)
 
 	if (sa_bulk_lookup(zp->z_sa_hdl, bulk, count)) {
 		zfs_znode_dmu_fini(zp);
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		return (EIO);
+		zfs_znode_hold_exit(zsb, zh);
+		return (SET_ERROR(EIO));
 	}
 
 	zp->z_mode = mode;
 
-	if (gen != zp->z_gen) {
+	if (gen != ZTOI(zp)->i_generation) {
 		zfs_znode_dmu_fini(zp);
-		ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
-		return (EIO);
+		zfs_znode_hold_exit(zsb, zh);
+		return (SET_ERROR(EIO));
 	}
 
 	zp->z_unlinked = (zp->z_links == 0);
 	zp->z_blksz = doi.doi_data_block_size;
+	zp->z_atime_dirty = 0;
+	zfs_inode_update_new(zp);
 
-	ZFS_OBJ_HOLD_EXIT(zsb, obj_num);
+	zfs_znode_hold_exit(zsb, zh);
 
 	return (0);
 }
@@ -1017,15 +1273,16 @@ zfs_znode_delete(znode_t *zp, dmu_tx_t *tx)
 	objset_t *os = zsb->z_os;
 	uint64_t obj = zp->z_id;
 	uint64_t acl_obj = zfs_external_acl(zp);
+	znode_hold_t *zh;
 
-	ZFS_OBJ_HOLD_ENTER(zsb, obj);
+	zh = zfs_znode_hold_enter(zsb, obj);
 	if (acl_obj) {
 		VERIFY(!zp->z_is_sa);
 		VERIFY(0 == dmu_object_free(os, acl_obj, tx));
 	}
 	VERIFY(0 == dmu_object_free(os, obj, tx));
 	zfs_znode_dmu_fini(zp);
-	ZFS_OBJ_HOLD_EXIT(zsb, obj);
+	zfs_znode_hold_exit(zsb, zh);
 }
 
 void
@@ -1033,23 +1290,14 @@ zfs_zinactive(znode_t *zp)
 {
 	zfs_sb_t *zsb = ZTOZSB(zp);
 	uint64_t z_id = zp->z_id;
-	boolean_t drop_mutex = 0;
+	znode_hold_t *zh;
 
 	ASSERT(zp->z_sa_hdl);
 
 	/*
 	 * Don't allow a zfs_zget() while were trying to release this znode.
-	 *
-	 * Linux allows direct memory reclaim which means that any KM_SLEEP
-	 * allocation may trigger inode eviction.  This can lead to a deadlock
-	 * through the ->shrink_icache_memory()->evict()->zfs_inactive()->
-	 * zfs_zinactive() call path.  To avoid this deadlock the process
-	 * must not reacquire the mutex when it is already holding it.
 	 */
-	if (!ZFS_OBJ_HOLD_OWNED(zsb, z_id)) {
-		ZFS_OBJ_HOLD_ENTER(zsb, z_id);
-		drop_mutex = 1;
-	}
+	zh = zfs_znode_hold_enter(zsb, z_id);
 
 	mutex_enter(&zp->z_lock);
 
@@ -1059,10 +1307,7 @@ zfs_zinactive(znode_t *zp)
 	 */
 	if (zp->z_unlinked) {
 		mutex_exit(&zp->z_lock);
-
-		if (drop_mutex)
-			ZFS_OBJ_HOLD_EXIT(zsb, z_id);
-
+		zfs_znode_hold_exit(zsb, zh);
 		zfs_rmnode(zp);
 		return;
 	}
@@ -1070,28 +1315,43 @@ zfs_zinactive(znode_t *zp)
 	mutex_exit(&zp->z_lock);
 	zfs_znode_dmu_fini(zp);
 
-	if (drop_mutex)
-		ZFS_OBJ_HOLD_EXIT(zsb, z_id);
+	zfs_znode_hold_exit(zsb, zh);
 }
 
+static inline int
+zfs_compare_timespec(struct timespec *t1, struct timespec *t2)
+{
+	if (t1->tv_sec < t2->tv_sec)
+		return (-1);
+
+	if (t1->tv_sec > t2->tv_sec)
+		return (1);
+
+	return (t1->tv_nsec - t2->tv_nsec);
+}
+
+/*
+ * Prepare to update znode time stamps.
+ *
+ *	IN:	zp	- znode requiring timestamp update
+ *		flag	- ATTR_MTIME, ATTR_CTIME flags
+ *
+ *	OUT:	zp	- z_seq
+ *		mtime	- new mtime
+ *		ctime	- new ctime
+ *
+ *	Note: We don't update atime here, because we rely on Linux VFS to do
+ *	atime updating.
+ */
 void
 zfs_tstamp_update_setup(znode_t *zp, uint_t flag, uint64_t mtime[2],
-    uint64_t ctime[2], boolean_t have_tx)
+    uint64_t ctime[2])
 {
 	timestruc_t	now;
 
 	gethrestime(&now);
 
-	if (have_tx) {	/* will sa_bulk_update happen really soon? */
-		zp->z_atime_dirty = 0;
-		zp->z_seq++;
-	} else {
-		zp->z_atime_dirty = 1;
-	}
-
-	if (flag & ATTR_ATIME) {
-		ZFS_TIME_ENCODE(&now, zp->z_atime);
-	}
+	zp->z_seq++;
 
 	if (flag & ATTR_MTIME) {
 		ZFS_TIME_ENCODE(&now, mtime);
@@ -1138,7 +1398,7 @@ zfs_grow_blocksize(znode_t *zp, uint64_t size, dmu_tx_t *tx)
 
 	if (error == ENOTSUP)
 		return;
-	ASSERT3U(error, ==, 0);
+	ASSERT0(error);
 
 	/* What blocksize did we actually get? */
 	dmu_object_size_from_db(sa_get_db(zp->z_sa_hdl), &zp->z_blksz, &dummy);
@@ -1150,8 +1410,7 @@ zfs_grow_blocksize(znode_t *zp, uint64_t size, dmu_tx_t *tx)
  *	IN:	zp	- znode of file to free data in.
  *		end	- new end-of-file
  *
- * 	RETURN:	0 if success
- *		error code if failure
+ *	RETURN:	0 on success, error code on failure
  */
 static int
 zfs_extend(znode_t *zp, uint64_t end)
@@ -1165,7 +1424,7 @@ zfs_extend(znode_t *zp, uint64_t end)
 	/*
 	 * We will change zp_size, lock the whole file.
 	 */
-	rl = zfs_range_lock(zp, 0, UINT64_MAX, RL_WRITER);
+	rl = zfs_range_lock(&zp->z_range_lock, 0, UINT64_MAX, RL_WRITER);
 
 	/*
 	 * Nothing to do if file already at desired length.
@@ -1174,7 +1433,6 @@ zfs_extend(znode_t *zp, uint64_t end)
 		zfs_range_unlock(rl);
 		return (0);
 	}
-top:
 	tx = dmu_tx_create(zsb->z_os);
 	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 	zfs_sa_upgrade_txholds(tx, zp);
@@ -1184,8 +1442,13 @@ top:
 		 * We are growing the file past the current block size.
 		 */
 		if (zp->z_blksz > ZTOZSB(zp)->z_max_blksz) {
+			/*
+			 * File's blocksize is already larger than the
+			 * "recordsize" property.  Only let it grow to
+			 * the next power of 2.
+			 */
 			ASSERT(!ISP2(zp->z_blksz));
-			newblksz = MIN(end, SPA_MAXBLOCKSIZE);
+			newblksz = MIN(end, 1 << highbit64(zp->z_blksz));
 		} else {
 			newblksz = MIN(end, ZTOZSB(zp)->z_max_blksz);
 		}
@@ -1194,13 +1457,8 @@ top:
 		newblksz = 0;
 	}
 
-	error = dmu_tx_assign(tx, TXG_NOWAIT);
+	error = dmu_tx_assign(tx, TXG_WAIT);
 	if (error) {
-		if (error == ERESTART) {
-			dmu_tx_wait(tx);
-			dmu_tx_abort(tx);
-			goto top;
-		}
 		dmu_tx_abort(tx);
 		zfs_range_unlock(rl);
 		return (error);
@@ -1222,14 +1480,56 @@ top:
 }
 
 /*
+ * zfs_zero_partial_page - Modeled after update_pages() but
+ * with different arguments and semantics for use by zfs_freesp().
+ *
+ * Zeroes a piece of a single page cache entry for zp at offset
+ * start and length len.
+ *
+ * Caller must acquire a range lock on the file for the region
+ * being zeroed in order that the ARC and page cache stay in sync.
+ */
+static void
+zfs_zero_partial_page(znode_t *zp, uint64_t start, uint64_t len)
+{
+	struct address_space *mp = ZTOI(zp)->i_mapping;
+	struct page *pp;
+	int64_t	off;
+	void *pb;
+
+	ASSERT((start & PAGE_MASK) == ((start + len - 1) & PAGE_MASK));
+
+	off = start & (PAGE_SIZE - 1);
+	start &= PAGE_MASK;
+
+	pp = find_lock_page(mp, start >> PAGE_SHIFT);
+	if (pp) {
+		if (mapping_writably_mapped(mp))
+			flush_dcache_page(pp);
+
+		pb = kmap(pp);
+		bzero(pb + off, len);
+		kunmap(pp);
+
+		if (mapping_writably_mapped(mp))
+			flush_dcache_page(pp);
+
+		mark_page_accessed(pp);
+		SetPageUptodate(pp);
+		ClearPageError(pp);
+		unlock_page(pp);
+		put_page(pp);
+	}
+}
+
+/*
  * Free space in a file.
  *
  *	IN:	zp	- znode of file to free data in.
  *		off	- start of section to free.
  *		len	- length of section to free.
  *
- *	RETURN:	0 if success
- *		error code if failure
+ *	RETURN:	0 on success, error code on failure
  */
 static int
 zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
@@ -1241,7 +1541,7 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
 	/*
 	 * Lock the range being freed.
 	 */
-	rl = zfs_range_lock(zp, off, len, RL_WRITER);
+	rl = zfs_range_lock(&zp->z_range_lock, off, len, RL_WRITER);
 
 	/*
 	 * Nothing to do if file already at desired length.
@@ -1256,6 +1556,47 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
 
 	error = dmu_free_long_range(zsb->z_os, zp->z_id, off, len);
 
+	/*
+	 * Zero partial page cache entries.  This must be done under a
+	 * range lock in order to keep the ARC and page cache in sync.
+	 */
+	if (zp->z_is_mapped) {
+		loff_t first_page, last_page, page_len;
+		loff_t first_page_offset, last_page_offset;
+
+		/* first possible full page in hole */
+		first_page = (off + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		/* last page of hole */
+		last_page = (off + len) >> PAGE_SHIFT;
+
+		/* offset of first_page */
+		first_page_offset = first_page << PAGE_SHIFT;
+		/* offset of last_page */
+		last_page_offset = last_page << PAGE_SHIFT;
+
+		/* truncate whole pages */
+		if (last_page_offset > first_page_offset) {
+			truncate_inode_pages_range(ZTOI(zp)->i_mapping,
+			    first_page_offset, last_page_offset - 1);
+		}
+
+		/* truncate sub-page ranges */
+		if (first_page > last_page) {
+			/* entire punched area within a single page */
+			zfs_zero_partial_page(zp, off, len);
+		} else {
+			/* beginning of punched area at the end of a page */
+			page_len  = first_page_offset - off;
+			if (page_len > 0)
+				zfs_zero_partial_page(zp, off, page_len);
+
+			/* end of punched area at the beginning of a page */
+			page_len = off + len - last_page_offset;
+			if (page_len > 0)
+				zfs_zero_partial_page(zp, last_page_offset,
+				    page_len);
+		}
+	}
 	zfs_range_unlock(rl);
 
 	return (error);
@@ -1267,8 +1608,7 @@ zfs_free_range(znode_t *zp, uint64_t off, uint64_t len)
  *	IN:	zp	- znode of file to free data in.
  *		end	- new end-of-file.
  *
- *	RETURN:	0 if success
- *		error code if failure
+ *	RETURN:	0 on success, error code on failure
  */
 static int
 zfs_trunc(znode_t *zp, uint64_t end)
@@ -1283,7 +1623,7 @@ zfs_trunc(znode_t *zp, uint64_t end)
 	/*
 	 * We will change zp_size, lock the whole file.
 	 */
-	rl = zfs_range_lock(zp, 0, UINT64_MAX, RL_WRITER);
+	rl = zfs_range_lock(&zp->z_range_lock, 0, UINT64_MAX, RL_WRITER);
 
 	/*
 	 * Nothing to do if file already at desired length.
@@ -1298,17 +1638,12 @@ zfs_trunc(znode_t *zp, uint64_t end)
 		zfs_range_unlock(rl);
 		return (error);
 	}
-top:
 	tx = dmu_tx_create(zsb->z_os);
 	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 	zfs_sa_upgrade_txholds(tx, zp);
-	error = dmu_tx_assign(tx, TXG_NOWAIT);
+	dmu_tx_mark_netfree(tx);
+	error = dmu_tx_assign(tx, TXG_WAIT);
 	if (error) {
-		if (error == ERESTART) {
-			dmu_tx_wait(tx);
-			dmu_tx_abort(tx);
-			goto top;
-		}
 		dmu_tx_abort(tx);
 		zfs_range_unlock(rl);
 		return (error);
@@ -1341,13 +1676,11 @@ top:
  *		flag	- current file open mode flags.
  *		log	- TRUE if this action should be logged
  *
- *	RETURN:	0 if success
- *		error code if failure
+ *	RETURN:	0 on success, error code on failure
  */
 int
 zfs_freesp(znode_t *zp, uint64_t off, uint64_t len, int flag, boolean_t log)
 {
-	struct inode *ip = ZTOI(zp);
 	dmu_tx_t *tx;
 	zfs_sb_t *zsb = ZTOZSB(zp);
 	zilog_t *zilog = zsb->z_log;
@@ -1365,17 +1698,7 @@ zfs_freesp(znode_t *zp, uint64_t off, uint64_t len, int flag, boolean_t log)
 		error =  zfs_extend(zp, off+len);
 		if (error == 0 && log)
 			goto log;
-		else
-			return (error);
-	}
-
-	/*
-	 * Check for any locks in the region to be freed.
-	 */
-	if (ip->i_flock && mandatory_lock(ip)) {
-		uint64_t length = (len ? len : zp->z_size - off);
-		if (!lock_may_write(ip, off, length))
-			return (EAGAIN);
+		goto out;
 	}
 
 	if (len == 0) {
@@ -1386,35 +1709,41 @@ zfs_freesp(znode_t *zp, uint64_t off, uint64_t len, int flag, boolean_t log)
 			error = zfs_extend(zp, off+len);
 	}
 	if (error || !log)
-		return (error);
+		goto out;
 log:
 	tx = dmu_tx_create(zsb->z_os);
 	dmu_tx_hold_sa(tx, zp->z_sa_hdl, B_FALSE);
 	zfs_sa_upgrade_txholds(tx, zp);
-	error = dmu_tx_assign(tx, TXG_NOWAIT);
+	error = dmu_tx_assign(tx, TXG_WAIT);
 	if (error) {
-		if (error == ERESTART) {
-			dmu_tx_wait(tx);
-			dmu_tx_abort(tx);
-			goto log;
-		}
 		dmu_tx_abort(tx);
-		return (error);
+		goto out;
 	}
 
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_MTIME(zsb), NULL, mtime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_CTIME(zsb), NULL, ctime, 16);
 	SA_ADD_BULK_ATTR(bulk, count, SA_ZPL_FLAGS(zsb),
 	    NULL, &zp->z_pflags, 8);
-	zfs_tstamp_update_setup(zp, CONTENT_MODIFIED, mtime, ctime, B_TRUE);
+	zfs_tstamp_update_setup(zp, CONTENT_MODIFIED, mtime, ctime);
 	error = sa_bulk_update(zp->z_sa_hdl, bulk, count, tx);
 	ASSERT(error == 0);
 
 	zfs_log_truncate(zilog, tx, TX_TRUNCATE, zp, off, len);
 
 	dmu_tx_commit(tx);
+
 	zfs_inode_update(zp);
-	return (0);
+	error = 0;
+
+out:
+	/*
+	 * Truncate the page cache - for file truncate operations, use
+	 * the purpose-built API for truncations.  For punching operations,
+	 * the truncation is handled under a range lock in zfs_free_range.
+	 */
+	if (len == 0)
+		truncate_setsize(ZTOI(zp), off);
+	return (error);
 }
 
 void
@@ -1426,6 +1755,7 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	uint64_t	sense = ZFS_CASE_SENSITIVE;
 	uint64_t	norm = 0;
 	nvpair_t	*elem;
+	int		size;
 	int		error;
 	int		i;
 	znode_t		*rootzp = NULL;
@@ -1444,6 +1774,14 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	error = zap_create_claim(os, moid, DMU_OT_MASTER_NODE,
 	    DMU_OT_NONE, 0, tx);
 	ASSERT(error == 0);
+
+	/*
+	 * Give dmu_object_alloc() a hint about where to start
+	 * allocating new objects. Otherwise, since the metadnode's
+	 * dnode_phys_t structure isn't initialized yet, dmu_object_next()
+	 * would fail and we'd have to skip to the next dnode block.
+	 */
+	os->os_obj_next = moid + 1;
 
 	/*
 	 * Set starting attributes.
@@ -1537,8 +1875,15 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	list_create(&zsb->z_all_znodes, sizeof (znode_t),
 	    offsetof(znode_t, z_link_node));
 
-	for (i = 0; i != ZFS_OBJ_MTX_SZ; i++)
-		mutex_init(&zsb->z_hold_mtx[i], NULL, MUTEX_DEFAULT, NULL);
+	size = MIN(1 << (highbit64(zfs_object_mutex_size)-1), ZFS_OBJ_MTX_MAX);
+	zsb->z_hold_size = size;
+	zsb->z_hold_trees = vmem_zalloc(sizeof (avl_tree_t) * size, KM_SLEEP);
+	zsb->z_hold_locks = vmem_zalloc(sizeof (kmutex_t) * size, KM_SLEEP);
+	for (i = 0; i != size; i++) {
+		avl_create(&zsb->z_hold_trees[i], zfs_znode_hold_compare,
+		    sizeof (znode_hold_t), offsetof(znode_hold_t, zh_node));
+		mutex_init(&zsb->z_hold_locks[i], NULL, MUTEX_DEFAULT, NULL);
+	}
 
 	VERIFY(0 == zfs_acl_ids_create(rootzp, IS_ROOT_NODE, &vattr,
 	    cr, NULL, &acl_ids));
@@ -1558,9 +1903,13 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
 	error = zfs_create_share_dir(zsb, tx);
 	ASSERT(error == 0);
 
-	for (i = 0; i != ZFS_OBJ_MTX_SZ; i++)
-		mutex_destroy(&zsb->z_hold_mtx[i]);
+	for (i = 0; i != size; i++) {
+		avl_destroy(&zsb->z_hold_trees[i]);
+		mutex_destroy(&zsb->z_hold_locks[i]);
+	}
 
+	vmem_free(zsb->z_hold_trees, sizeof (avl_tree_t) * size);
+	vmem_free(zsb->z_hold_locks, sizeof (kmutex_t) * size);
 	kmem_free(sb, sizeof (struct super_block));
 	kmem_free(zsb, sizeof (zfs_sb_t));
 }
@@ -1596,7 +1945,7 @@ zfs_grab_sa_handle(objset_t *osp, uint64_t obj, sa_handle_t **hdlp,
 	    (doi.doi_bonus_type == DMU_OT_ZNODE &&
 	    doi.doi_bonus_size < sizeof (znode_phys_t))) {
 		sa_buf_rele(*db, tag);
-		return (ENOTSUP);
+		return (SET_ERROR(ENOTSUP));
 	}
 
 	error = sa_handle_get(osp, obj, NULL, SA_HDL_PRIVATE, hdlp);
@@ -1620,13 +1969,16 @@ zfs_release_sa_handle(sa_handle_t *hdl, dmu_buf_t *db, void *tag)
  * or not the object is an extended attribute directory.
  */
 static int
-zfs_obj_to_pobj(sa_handle_t *hdl, sa_attr_type_t *sa_table, uint64_t *pobjp,
-    int *is_xattrdir)
+zfs_obj_to_pobj(objset_t *osp, sa_handle_t *hdl, sa_attr_type_t *sa_table,
+    uint64_t *pobjp, int *is_xattrdir)
 {
 	uint64_t parent;
 	uint64_t pflags;
 	uint64_t mode;
+	uint64_t parent_mode;
 	sa_bulk_attr_t bulk[3];
+	sa_handle_t *sa_hdl;
+	dmu_buf_t *sa_db;
 	int count = 0;
 	int error;
 
@@ -1640,8 +1992,31 @@ zfs_obj_to_pobj(sa_handle_t *hdl, sa_attr_type_t *sa_table, uint64_t *pobjp,
 	if ((error = sa_bulk_lookup(hdl, bulk, count)) != 0)
 		return (error);
 
-	*pobjp = parent;
+	/*
+	 * When a link is removed its parent pointer is not changed and will
+	 * be invalid.  There are two cases where a link is removed but the
+	 * file stays around, when it goes to the delete queue and when there
+	 * are additional links.
+	 */
+	error = zfs_grab_sa_handle(osp, parent, &sa_hdl, &sa_db, FTAG);
+	if (error != 0)
+		return (error);
+
+	error = sa_lookup(sa_hdl, ZPL_MODE, &parent_mode, sizeof (parent_mode));
+	zfs_release_sa_handle(sa_hdl, sa_db, FTAG);
+	if (error != 0)
+		return (error);
+
 	*is_xattrdir = ((pflags & ZFS_XATTR) != 0) && S_ISDIR(mode);
+
+	/*
+	 * Extended attributes can be applied to files, directories, etc.
+	 * Otherwise the parent must be a directory.
+	 */
+	if (!*is_xattrdir && !S_ISDIR(parent_mode))
+		return (EINVAL);
+
+	*pobjp = parent;
 
 	return (0);
 }
@@ -1683,15 +2058,15 @@ zfs_obj_to_path_impl(objset_t *osp, uint64_t obj, sa_handle_t *hdl,
 	sa_hdl = hdl;
 
 	for (;;) {
-		uint64_t pobj;
+		uint64_t pobj = 0;
 		char component[MAXNAMELEN + 2];
 		size_t complen;
-		int is_xattrdir;
+		int is_xattrdir = 0;
 
 		if (prevdb)
 			zfs_release_sa_handle(prevhdl, prevdb, FTAG);
 
-		if ((error = zfs_obj_to_pobj(sa_hdl, sa_table, &pobj,
+		if ((error = zfs_obj_to_pobj(osp, sa_hdl, sa_table, &pobj,
 		    &is_xattrdir)) != 0)
 			break;
 
@@ -1797,4 +2172,7 @@ zfs_obj_to_stats(objset_t *osp, uint64_t obj, zfs_stat_t *sb,
 #if defined(_KERNEL) && defined(HAVE_SPL)
 EXPORT_SYMBOL(zfs_create_fs);
 EXPORT_SYMBOL(zfs_obj_to_path);
+
+module_param(zfs_object_mutex_size, uint, 0644);
+MODULE_PARM_DESC(zfs_object_mutex_size, "Size of znode hold array");
 #endif

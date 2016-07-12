@@ -18,8 +18,11 @@
  *
  * CDDL HEADER END
  */
+
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
+ * Copyright (c) 2013 Steven Hartland. All rights reserved.
  */
 
 /*
@@ -42,6 +45,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "libzfs_impl.h"
+#include "zfeature_common.h"
 
 /*
  * Message ID table.  This must be kept in sync with the ZPOOL_STATUS_* defines
@@ -63,6 +67,7 @@ static char *zfs_msgid_table[] = {
 	"ZFS-8000-HC",
 	"ZFS-8000-JQ",
 	"ZFS-8000-K4",
+	"ZFS-8000-ER",
 };
 
 #define	NMSGID	(sizeof (zfs_msgid_table) / sizeof (zfs_msgid_table[0]))
@@ -147,6 +152,16 @@ find_vdev_problem(nvlist_t *vdev, int (*func)(uint64_t, uint64_t, uint64_t))
 			return (B_TRUE);
 	}
 
+	/*
+	 * Check any L2 cache devs
+	 */
+	if (nvlist_lookup_nvlist_array(vdev, ZPOOL_CONFIG_L2CACHE, &child,
+	    &children) == 0) {
+		for (c = 0; c < children; c++)
+			if (find_vdev_problem(child[c], func))
+				return (B_TRUE);
+	}
+
 	return (B_FALSE);
 }
 
@@ -168,7 +183,7 @@ find_vdev_problem(nvlist_t *vdev, int (*func)(uint64_t, uint64_t, uint64_t))
  * only picks the most damaging of all the current errors to report.
  */
 static zpool_status_t
-check_status(nvlist_t *config, boolean_t isimport)
+check_status(nvlist_t *config, boolean_t isimport, zpool_errata_t *erratap)
 {
 	nvlist_t *nvroot;
 	vdev_stat_t *vs;
@@ -179,7 +194,8 @@ check_status(nvlist_t *config, boolean_t isimport)
 	uint64_t stateval;
 	uint64_t suspended;
 	uint64_t hostid = 0;
-	unsigned long system_hostid = gethostid() & 0xffffffff;
+	uint64_t errata = 0;
+	unsigned long system_hostid = get_system_hostid();
 
 	verify(nvlist_lookup_uint64(config, ZPOOL_CONFIG_VERSION,
 	    &version) == 0);
@@ -213,6 +229,20 @@ check_status(nvlist_t *config, boolean_t isimport)
 	if (vs->vs_state == VDEV_STATE_CANT_OPEN &&
 	    vs->vs_aux == VDEV_AUX_VERSION_NEWER)
 		return (ZPOOL_STATUS_VERSION_NEWER);
+
+	/*
+	 * Unsupported feature(s).
+	 */
+	if (vs->vs_state == VDEV_STATE_CANT_OPEN &&
+	    vs->vs_aux == VDEV_AUX_UNSUP_FEAT) {
+		nvlist_t *nvinfo;
+
+		verify(nvlist_lookup_nvlist(config, ZPOOL_CONFIG_LOAD_INFO,
+		    &nvinfo) == 0);
+		if (nvlist_exists(nvinfo, ZPOOL_CONFIG_CAN_RDONLY))
+			return (ZPOOL_STATUS_UNSUP_FEAT_WRITE);
+		return (ZPOOL_STATUS_UNSUP_FEAT_READ);
+	}
 
 	/*
 	 * Check that the config is complete.
@@ -301,16 +331,49 @@ check_status(nvlist_t *config, boolean_t isimport)
 	/*
 	 * Outdated, but usable, version
 	 */
-	if (version < SPA_VERSION)
+	if (SPA_VERSION_IS_SUPPORTED(version) && version != SPA_VERSION)
 		return (ZPOOL_STATUS_VERSION_OLDER);
+
+	/*
+	 * Usable pool with disabled features
+	 */
+	if (version >= SPA_VERSION_FEATURES) {
+		int i;
+		nvlist_t *feat;
+
+		if (isimport) {
+			feat = fnvlist_lookup_nvlist(config,
+			    ZPOOL_CONFIG_LOAD_INFO);
+			feat = fnvlist_lookup_nvlist(feat,
+			    ZPOOL_CONFIG_ENABLED_FEAT);
+		} else {
+			feat = fnvlist_lookup_nvlist(config,
+			    ZPOOL_CONFIG_FEATURE_STATS);
+		}
+
+		for (i = 0; i < SPA_FEATURES; i++) {
+			zfeature_info_t *fi = &spa_feature_table[i];
+			if (!nvlist_exists(feat, fi->fi_guid))
+				return (ZPOOL_STATUS_FEAT_DISABLED);
+		}
+	}
+
+	/*
+	 * Informational errata available.
+	 */
+	(void) nvlist_lookup_uint64(config, ZPOOL_CONFIG_ERRATA, &errata);
+	if (errata) {
+		*erratap = errata;
+		return (ZPOOL_STATUS_ERRATA);
+	}
 
 	return (ZPOOL_STATUS_OK);
 }
 
 zpool_status_t
-zpool_get_status(zpool_handle_t *zhp, char **msgid)
+zpool_get_status(zpool_handle_t *zhp, char **msgid, zpool_errata_t *errata)
 {
-	zpool_status_t ret = check_status(zhp->zpool_config, B_FALSE);
+	zpool_status_t ret = check_status(zhp->zpool_config, B_FALSE, errata);
 
 	if (ret >= NMSGID)
 		*msgid = NULL;
@@ -321,9 +384,9 @@ zpool_get_status(zpool_handle_t *zhp, char **msgid)
 }
 
 zpool_status_t
-zpool_import_status(nvlist_t *config, char **msgid)
+zpool_import_status(nvlist_t *config, char **msgid, zpool_errata_t *errata)
 {
-	zpool_status_t ret = check_status(config, B_TRUE);
+	zpool_status_t ret = check_status(config, B_TRUE, errata);
 
 	if (ret >= NMSGID)
 		*msgid = NULL;

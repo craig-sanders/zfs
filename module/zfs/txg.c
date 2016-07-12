@@ -20,18 +20,91 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Portions Copyright 2011 Martin Matuska
+ * Copyright (c) 2012, 2014 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
 #include <sys/txg_impl.h>
 #include <sys/dmu_impl.h>
+#include <sys/spa_impl.h>
 #include <sys/dmu_tx.h>
 #include <sys/dsl_pool.h>
 #include <sys/dsl_scan.h>
 #include <sys/callb.h>
+#include <sys/trace_txg.h>
 
 /*
- * Pool-wide transaction groups.
+ * ZFS Transaction Groups
+ * ----------------------
+ *
+ * ZFS transaction groups are, as the name implies, groups of transactions
+ * that act on persistent state. ZFS asserts consistency at the granularity of
+ * these transaction groups. Each successive transaction group (txg) is
+ * assigned a 64-bit consecutive identifier. There are three active
+ * transaction group states: open, quiescing, or syncing. At any given time,
+ * there may be an active txg associated with each state; each active txg may
+ * either be processing, or blocked waiting to enter the next state. There may
+ * be up to three active txgs, and there is always a txg in the open state
+ * (though it may be blocked waiting to enter the quiescing state). In broad
+ * strokes, transactions -- operations that change in-memory structures -- are
+ * accepted into the txg in the open state, and are completed while the txg is
+ * in the open or quiescing states. The accumulated changes are written to
+ * disk in the syncing state.
+ *
+ * Open
+ *
+ * When a new txg becomes active, it first enters the open state. New
+ * transactions -- updates to in-memory structures -- are assigned to the
+ * currently open txg. There is always a txg in the open state so that ZFS can
+ * accept new changes (though the txg may refuse new changes if it has hit
+ * some limit). ZFS advances the open txg to the next state for a variety of
+ * reasons such as it hitting a time or size threshold, or the execution of an
+ * administrative action that must be completed in the syncing state.
+ *
+ * Quiescing
+ *
+ * After a txg exits the open state, it enters the quiescing state. The
+ * quiescing state is intended to provide a buffer between accepting new
+ * transactions in the open state and writing them out to stable storage in
+ * the syncing state. While quiescing, transactions can continue their
+ * operation without delaying either of the other states. Typically, a txg is
+ * in the quiescing state very briefly since the operations are bounded by
+ * software latencies rather than, say, slower I/O latencies. After all
+ * transactions complete, the txg is ready to enter the next state.
+ *
+ * Syncing
+ *
+ * In the syncing state, the in-memory state built up during the open and (to
+ * a lesser degree) the quiescing states is written to stable storage. The
+ * process of writing out modified data can, in turn modify more data. For
+ * example when we write new blocks, we need to allocate space for them; those
+ * allocations modify metadata (space maps)... which themselves must be
+ * written to stable storage. During the sync state, ZFS iterates, writing out
+ * data until it converges and all in-memory changes have been written out.
+ * The first such pass is the largest as it encompasses all the modified user
+ * data (as opposed to filesystem metadata). Subsequent passes typically have
+ * far less data to write as they consist exclusively of filesystem metadata.
+ *
+ * To ensure convergence, after a certain number of passes ZFS begins
+ * overwriting locations on stable storage that had been allocated earlier in
+ * the syncing state (and subsequently freed). ZFS usually allocates new
+ * blocks to optimize for large, continuous, writes. For the syncing state to
+ * converge however it must complete a pass where no new blocks are allocated
+ * since each allocation requires a modification of persistent metadata.
+ * Further, to hasten convergence, after a prescribed number of passes, ZFS
+ * also defers frees, and stops compressing.
+ *
+ * In addition to writing out user data, we must also execute synctasks during
+ * the syncing context. A synctask is the mechanism by which some
+ * administrative activities work such as creating and destroying snapshots or
+ * datasets. Note that when a synctask is initiated it enters the open txg,
+ * and ZFS then pushes that txg as quickly as possible to completion of the
+ * syncing state in order to reduce the latency of the administrative
+ * activity. To complete the syncing state, ZFS writes out a new uberblock,
+ * the root of the tree of blocks that comprise all state stored on the ZFS
+ * pool. Finally, if there is a quiesced txg waiting, we signal that it can
+ * now transition to the syncing state.
  */
 
 static void txg_sync_thread(dsl_pool_t *dp);
@@ -55,6 +128,8 @@ txg_init(dsl_pool_t *dp, uint64_t txg)
 		int i;
 
 		mutex_init(&tx->tx_cpu[c].tc_lock, NULL, MUTEX_DEFAULT, NULL);
+		mutex_init(&tx->tx_cpu[c].tc_open_lock, NULL, MUTEX_NOLOCKDEP,
+		    NULL);
 		for (i = 0; i < TXG_SIZE; i++) {
 			cv_init(&tx->tx_cpu[c].tc_cv[i], NULL, CV_DEFAULT,
 			    NULL);
@@ -97,6 +172,7 @@ txg_fini(dsl_pool_t *dp)
 	for (c = 0; c < max_ncpus; c++) {
 		int i;
 
+		mutex_destroy(&tx->tx_cpu[c].tc_open_lock);
 		mutex_destroy(&tx->tx_cpu[c].tc_lock);
 		for (i = 0; i < TXG_SIZE; i++) {
 			cv_destroy(&tx->tx_cpu[c].tc_cv[i]);
@@ -129,15 +205,15 @@ txg_sync_start(dsl_pool_t *dp)
 	tx->tx_threads = 2;
 
 	tx->tx_quiesce_thread = thread_create(NULL, 0, txg_quiesce_thread,
-	    dp, 0, &p0, TS_RUN, minclsyspri);
+	    dp, 0, &p0, TS_RUN, defclsyspri);
 
 	/*
 	 * The sync thread can need a larger-than-default stack size on
 	 * 32-bit x86.  This is due in part to nested pools and
 	 * scrub_visitbp() recursion.
 	 */
-	tx->tx_sync_thread = thread_create(NULL, 32<<10, txg_sync_thread,
-	    dp, 0, &p0, TS_RUN, minclsyspri);
+	tx->tx_sync_thread = thread_create(NULL, 0, txg_sync_thread,
+	    dp, 0, &p0, TS_RUN, defclsyspri);
 
 	mutex_exit(&tx->tx_sync_lock);
 }
@@ -161,15 +237,15 @@ txg_thread_exit(tx_state_t *tx, callb_cpr_t *cpr, kthread_t **tpp)
 }
 
 static void
-txg_thread_wait(tx_state_t *tx, callb_cpr_t *cpr, kcondvar_t *cv, uint64_t time)
+txg_thread_wait(tx_state_t *tx, callb_cpr_t *cpr, kcondvar_t *cv, clock_t time)
 {
 	CALLB_CPR_SAFE_BEGIN(cpr);
 
 	if (time)
-		(void) cv_timedwait_interruptible(cv, &tx->tx_sync_lock,
+		(void) cv_timedwait_sig(cv, &tx->tx_sync_lock,
 		    ddi_get_lbolt() + time);
 	else
-		cv_wait_interruptible(cv, &tx->tx_sync_lock);
+		cv_wait_sig(cv, &tx->tx_sync_lock);
 
 	CALLB_CPR_SAFE_END(cpr, &tx->tx_sync_lock);
 }
@@ -218,13 +294,25 @@ uint64_t
 txg_hold_open(dsl_pool_t *dp, txg_handle_t *th)
 {
 	tx_state_t *tx = &dp->dp_tx;
-	tx_cpu_t *tc = &tx->tx_cpu[CPU_SEQID];
+	tx_cpu_t *tc;
 	uint64_t txg;
 
-	mutex_enter(&tc->tc_lock);
+	/*
+	 * It appears the processor id is simply used as a "random"
+	 * number to index into the array, and there isn't any other
+	 * significance to the chosen tx_cpu. Because.. Why not use
+	 * the current cpu to index into the array?
+	 */
+	kpreempt_disable();
+	tc = &tx->tx_cpu[CPU_SEQID];
+	kpreempt_enable();
 
+	mutex_enter(&tc->tc_open_lock);
 	txg = tx->tx_open_txg;
+
+	mutex_enter(&tc->tc_lock);
 	tc->tc_count[txg & TXG_MASK]++;
+	mutex_exit(&tc->tc_lock);
 
 	th->th_cpu = tc;
 	th->th_txg = txg;
@@ -237,7 +325,8 @@ txg_rele_to_quiesce(txg_handle_t *th)
 {
 	tx_cpu_t *tc = th->th_cpu;
 
-	mutex_exit(&tc->tc_lock);
+	ASSERT(!MUTEX_HELD(&tc->tc_lock));
+	mutex_exit(&tc->tc_open_lock);
 }
 
 void
@@ -266,6 +355,12 @@ txg_rele_to_sync(txg_handle_t *th)
 	th->th_cpu = NULL;	/* defensive */
 }
 
+/*
+ * Blocks until all transactions in the group are committed.
+ *
+ * On return, the transaction group has reached a stable state in which it can
+ * then be passed off to the syncing context.
+ */
 static void
 txg_quiesce(dsl_pool_t *dp, uint64_t txg)
 {
@@ -274,20 +369,27 @@ txg_quiesce(dsl_pool_t *dp, uint64_t txg)
 	int c;
 
 	/*
-	 * Grab all tx_cpu locks so nobody else can get into this txg.
+	 * Grab all tc_open_locks so nobody else can get into this txg.
 	 */
 	for (c = 0; c < max_ncpus; c++)
-		mutex_enter(&tx->tx_cpu[c].tc_lock);
+		mutex_enter(&tx->tx_cpu[c].tc_open_lock);
 
 	ASSERT(txg == tx->tx_open_txg);
 	tx->tx_open_txg++;
+	tx->tx_open_time = gethrtime();
+
+	spa_txg_history_set(dp->dp_spa, txg, TXG_STATE_OPEN, tx->tx_open_time);
+	spa_txg_history_add(dp->dp_spa, tx->tx_open_txg, tx->tx_open_time);
+
+	DTRACE_PROBE2(txg__quiescing, dsl_pool_t *, dp, uint64_t, txg);
+	DTRACE_PROBE2(txg__opened, dsl_pool_t *, dp, uint64_t, tx->tx_open_txg);
 
 	/*
 	 * Now that we've incremented tx_open_txg, we can let threads
 	 * enter the next transaction group.
 	 */
 	for (c = 0; c < max_ncpus; c++)
-		mutex_exit(&tx->tx_cpu[c].tc_lock);
+		mutex_exit(&tx->tx_cpu[c].tc_open_lock);
 
 	/*
 	 * Quiesce the transaction group by waiting for everyone to txg_exit().
@@ -299,6 +401,8 @@ txg_quiesce(dsl_pool_t *dp, uint64_t txg)
 			cv_wait(&tc->tc_cv[g], &tc->tc_lock);
 		mutex_exit(&tc->tc_lock);
 	}
+
+	spa_txg_history_set(dp->dp_spa, txg, TXG_STATE_QUIESCED, gethrtime());
 }
 
 static void
@@ -313,6 +417,9 @@ txg_do_callbacks(list_t *cb_list)
 
 /*
  * Dispatch the commit callbacks registered on this txg to worker threads.
+ *
+ * If no callbacks are registered for a given TXG, nothing happens.
+ * This function creates a taskq for the associated pool, if needed.
  */
 static void
 txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
@@ -323,7 +430,10 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 
 	for (c = 0; c < max_ncpus; c++) {
 		tx_cpu_t *tc = &tx->tx_cpu[c];
-		/* No need to lock tx_cpu_t at this point */
+		/*
+		 * No need to lock tx_cpu_t at this point, since this can
+		 * only be called once a txg has been synced.
+		 */
 
 		int g = txg & TXG_MASK;
 
@@ -335,8 +445,8 @@ txg_dispatch_callbacks(dsl_pool_t *dp, uint64_t txg)
 			 * Commit callback taskq hasn't been created yet.
 			 */
 			tx->tx_commit_cb_taskq = taskq_create("tx_commit_cb",
-			    100, minclsyspri, max_ncpus, INT_MAX,
-			    TASKQ_THREADS_CPU_PCT | TASKQ_PREPOPULATE);
+			    max_ncpus, defclsyspri, max_ncpus, max_ncpus * 2,
+			    TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
 		}
 
 		cb_list = kmem_alloc(sizeof (list_t), KM_SLEEP);
@@ -361,7 +471,7 @@ txg_wait_callbacks(dsl_pool_t *dp)
 	tx_state_t *tx = &dp->dp_tx;
 
 	if (tx->tx_commit_cb_taskq != NULL)
-		taskq_wait(tx->tx_commit_cb_taskq);
+		taskq_wait_outstanding(tx->tx_commit_cb_taskq, 0);
 }
 
 static void
@@ -370,27 +480,22 @@ txg_sync_thread(dsl_pool_t *dp)
 	spa_t *spa = dp->dp_spa;
 	tx_state_t *tx = &dp->dp_tx;
 	callb_cpr_t cpr;
-	uint64_t start, delta;
+	vdev_stat_t *vs1, *vs2;
+	clock_t start, delta;
 
-#ifdef _KERNEL
-	/*
-	 * Disable the normal reclaim path for the txg_sync thread.  This
-	 * ensures the thread will never enter dmu_tx_assign() which can
-	 * otherwise occur due to direct reclaim.  If this is allowed to
-	 * happen the system can deadlock.  Direct reclaim call path:
-	 *
-	 *   ->shrink_icache_memory->prune_icache->dispose_list->
-	 *   clear_inode->zpl_clear_inode->zfs_inactive->dmu_tx_assign
-	 */
-	current->flags |= PF_MEMALLOC;
-#endif /* _KERNEL */
-
+	(void) spl_fstrans_mark();
 	txg_thread_enter(tx, &cpr);
+
+	vs1 = kmem_alloc(sizeof (vdev_stat_t), KM_SLEEP);
+	vs2 = kmem_alloc(sizeof (vdev_stat_t), KM_SLEEP);
 
 	start = delta = 0;
 	for (;;) {
-		uint64_t timer, timeout = zfs_txg_timeout * hz;
+		clock_t timer, timeout;
 		uint64_t txg;
+		uint64_t ndirty;
+
+		timeout = zfs_txg_timeout * hz;
 
 		/*
 		 * We sync when we're scanning, there's someone waiting
@@ -401,7 +506,8 @@ txg_sync_thread(dsl_pool_t *dp)
 		while (!dsl_scan_active(dp->dp_scan) &&
 		    !tx->tx_exiting && timer > 0 &&
 		    tx->tx_synced_txg >= tx->tx_sync_txg_waiting &&
-		    tx->tx_quiesced_txg == 0) {
+		    tx->tx_quiesced_txg == 0 &&
+		    dp->dp_dirty_total < zfs_dirty_data_sync) {
 			dprintf("waiting; tx_synced=%llu waiting=%llu dp=%p\n",
 			    tx->tx_synced_txg, tx->tx_sync_txg_waiting, dp);
 			txg_thread_wait(tx, &cpr, &tx->tx_sync_more_cv, timer);
@@ -420,8 +526,15 @@ txg_sync_thread(dsl_pool_t *dp)
 			txg_thread_wait(tx, &cpr, &tx->tx_quiesce_done_cv, 0);
 		}
 
-		if (tx->tx_exiting)
+		if (tx->tx_exiting) {
+			kmem_free(vs2, sizeof (vdev_stat_t));
+			kmem_free(vs1, sizeof (vdev_stat_t));
 			txg_thread_exit(tx, &cpr, &tx->tx_sync_thread);
+		}
+
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+		vdev_get_stats(spa->spa_root_vdev, vs1);
+		spa_config_exit(spa, SCL_ALL, FTAG);
 
 		/*
 		 * Consume the quiesced txg which has been handed off to
@@ -431,11 +544,16 @@ txg_sync_thread(dsl_pool_t *dp)
 		txg = tx->tx_quiesced_txg;
 		tx->tx_quiesced_txg = 0;
 		tx->tx_syncing_txg = txg;
+		DTRACE_PROBE2(txg__syncing, dsl_pool_t *, dp, uint64_t, txg);
 		cv_broadcast(&tx->tx_quiesce_more_cv);
 
 		dprintf("txg=%llu quiesce_txg=%llu sync_txg=%llu\n",
 		    txg, tx->tx_quiesce_txg_waiting, tx->tx_sync_txg_waiting);
 		mutex_exit(&tx->tx_sync_lock);
+
+		spa_txg_history_set(spa, txg, TXG_STATE_WAIT_FOR_SYNC,
+		    gethrtime());
+		ndirty = dp->dp_dirty_pertxg[txg & TXG_MASK];
 
 		start = ddi_get_lbolt();
 		spa_sync(spa, txg);
@@ -444,12 +562,24 @@ txg_sync_thread(dsl_pool_t *dp)
 		mutex_enter(&tx->tx_sync_lock);
 		tx->tx_synced_txg = txg;
 		tx->tx_syncing_txg = 0;
+		DTRACE_PROBE2(txg__synced, dsl_pool_t *, dp, uint64_t, txg);
 		cv_broadcast(&tx->tx_sync_done_cv);
 
 		/*
 		 * Dispatch commit callbacks to worker threads.
 		 */
 		txg_dispatch_callbacks(dp, txg);
+
+		spa_config_enter(spa, SCL_ALL, FTAG, RW_READER);
+		vdev_get_stats(spa->spa_root_vdev, vs2);
+		spa_config_exit(spa, SCL_ALL, FTAG);
+		spa_txg_history_set_io(spa, txg,
+		    vs2->vs_bytes[ZIO_TYPE_READ]-vs1->vs_bytes[ZIO_TYPE_READ],
+		    vs2->vs_bytes[ZIO_TYPE_WRITE]-vs1->vs_bytes[ZIO_TYPE_WRITE],
+		    vs2->vs_ops[ZIO_TYPE_READ]-vs1->vs_ops[ZIO_TYPE_READ],
+		    vs2->vs_ops[ZIO_TYPE_WRITE]-vs1->vs_ops[ZIO_TYPE_WRITE],
+		    ndirty);
+		spa_txg_history_set(spa, txg, TXG_STATE_SYNCED, gethrtime());
 	}
 }
 
@@ -492,23 +622,24 @@ txg_quiesce_thread(dsl_pool_t *dp)
 		 */
 		dprintf("quiesce done, handing off txg %llu\n", txg);
 		tx->tx_quiesced_txg = txg;
+		DTRACE_PROBE2(txg__quiesced, dsl_pool_t *, dp, uint64_t, txg);
 		cv_broadcast(&tx->tx_sync_more_cv);
 		cv_broadcast(&tx->tx_quiesce_done_cv);
 	}
 }
 
 /*
- * Delay this thread by 'ticks' if we are still in the open transaction
- * group and there is already a waiting txg quiesing or quiesced.  Abort
- * the delay if this txg stalls or enters the quiesing state.
+ * Delay this thread by delay nanoseconds if we are still in the open
+ * transaction group and there is already a waiting txg quiesing or quiesced.
+ * Abort the delay if this txg stalls or enters the quiesing state.
  */
 void
-txg_delay(dsl_pool_t *dp, uint64_t txg, int ticks)
+txg_delay(dsl_pool_t *dp, uint64_t txg, hrtime_t delay, hrtime_t resolution)
 {
 	tx_state_t *tx = &dp->dp_tx;
-	clock_t timeout = ddi_get_lbolt() + ticks;
+	hrtime_t start = gethrtime();
 
-	/* don't delay if this txg could transition to quiesing immediately */
+	/* don't delay if this txg could transition to quiescing immediately */
 	if (tx->tx_open_txg > txg ||
 	    tx->tx_syncing_txg == txg-1 || tx->tx_synced_txg == txg-1)
 		return;
@@ -519,10 +650,11 @@ txg_delay(dsl_pool_t *dp, uint64_t txg, int ticks)
 		return;
 	}
 
-	while (ddi_get_lbolt() < timeout &&
-	    tx->tx_syncing_txg < txg-1 && !txg_stalled(dp))
-		(void) cv_timedwait(&tx->tx_quiesce_more_cv, &tx->tx_sync_lock,
-		    timeout);
+	while (gethrtime() - start < delay &&
+	    tx->tx_syncing_txg < txg-1 && !txg_stalled(dp)) {
+		(void) cv_timedwait_hires(&tx->tx_quiesce_more_cv,
+		    &tx->tx_sync_lock, delay, resolution, 0);
+	}
 
 	DMU_TX_STAT_BUMP(dmu_tx_delay);
 
@@ -533,6 +665,8 @@ void
 txg_wait_synced(dsl_pool_t *dp, uint64_t txg)
 {
 	tx_state_t *tx = &dp->dp_tx;
+
+	ASSERT(!dsl_pool_config_held(dp));
 
 	mutex_enter(&tx->tx_sync_lock);
 	ASSERT(tx->tx_threads == 2);
@@ -557,6 +691,8 @@ txg_wait_open(dsl_pool_t *dp, uint64_t txg)
 {
 	tx_state_t *tx = &dp->dp_tx;
 
+	ASSERT(!dsl_pool_config_held(dp));
+
 	mutex_enter(&tx->tx_sync_lock);
 	ASSERT(tx->tx_threads == 2);
 	if (txg == 0)
@@ -568,6 +704,28 @@ txg_wait_open(dsl_pool_t *dp, uint64_t txg)
 	while (tx->tx_open_txg < txg) {
 		cv_broadcast(&tx->tx_quiesce_more_cv);
 		cv_wait(&tx->tx_quiesce_done_cv, &tx->tx_sync_lock);
+	}
+	mutex_exit(&tx->tx_sync_lock);
+}
+
+/*
+ * If there isn't a txg syncing or in the pipeline, push another txg through
+ * the pipeline by queiscing the open txg.
+ */
+void
+txg_kick(dsl_pool_t *dp)
+{
+	tx_state_t *tx = &dp->dp_tx;
+
+	ASSERT(!dsl_pool_config_held(dp));
+
+	mutex_enter(&tx->tx_sync_lock);
+	if (tx->tx_syncing_txg == 0 &&
+	    tx->tx_quiesce_txg_waiting <= tx->tx_open_txg &&
+	    tx->tx_sync_txg_waiting <= tx->tx_synced_txg &&
+	    tx->tx_quiesced_txg <= tx->tx_synced_txg) {
+		tx->tx_quiesce_txg_waiting = tx->tx_open_txg + 1;
+		cv_broadcast(&tx->tx_quiesce_more_cv);
 	}
 	mutex_exit(&tx->tx_sync_lock);
 }
@@ -615,49 +773,70 @@ txg_list_destroy(txg_list_t *tl)
 	mutex_destroy(&tl->tl_lock);
 }
 
-int
+boolean_t
 txg_list_empty(txg_list_t *tl, uint64_t txg)
 {
 	return (tl->tl_head[txg & TXG_MASK] == NULL);
 }
 
 /*
- * Add an entry to the list.
- * Returns 0 if it's a new entry, 1 if it's already there.
+ * Returns true if all txg lists are empty.
+ *
+ * Warning: this is inherently racy (an item could be added immediately
+ * after this function returns). We don't bother with the lock because
+ * it wouldn't change the semantics.
  */
-int
+boolean_t
+txg_all_lists_empty(txg_list_t *tl)
+{
+	int i;
+
+	for (i = 0; i < TXG_SIZE; i++) {
+		if (!txg_list_empty(tl, i)) {
+			return (B_FALSE);
+		}
+	}
+	return (B_TRUE);
+}
+
+/*
+ * Add an entry to the list (unless it's already on the list).
+ * Returns B_TRUE if it was actually added.
+ */
+boolean_t
 txg_list_add(txg_list_t *tl, void *p, uint64_t txg)
 {
 	int t = txg & TXG_MASK;
 	txg_node_t *tn = (txg_node_t *)((char *)p + tl->tl_offset);
-	int already_on_list;
+	boolean_t add;
 
 	mutex_enter(&tl->tl_lock);
-	already_on_list = tn->tn_member[t];
-	if (!already_on_list) {
+	add = (tn->tn_member[t] == 0);
+	if (add) {
 		tn->tn_member[t] = 1;
 		tn->tn_next[t] = tl->tl_head[t];
 		tl->tl_head[t] = tn;
 	}
 	mutex_exit(&tl->tl_lock);
 
-	return (already_on_list);
+	return (add);
 }
 
 /*
- * Add an entry to the end of the list (walks list to find end).
- * Returns 0 if it's a new entry, 1 if it's already there.
+ * Add an entry to the end of the list, unless it's already on the list.
+ * (walks list to find end)
+ * Returns B_TRUE if it was actually added.
  */
-int
+boolean_t
 txg_list_add_tail(txg_list_t *tl, void *p, uint64_t txg)
 {
 	int t = txg & TXG_MASK;
 	txg_node_t *tn = (txg_node_t *)((char *)p + tl->tl_offset);
-	int already_on_list;
+	boolean_t add;
 
 	mutex_enter(&tl->tl_lock);
-	already_on_list = tn->tn_member[t];
-	if (!already_on_list) {
+	add = (tn->tn_member[t] == 0);
+	if (add) {
 		txg_node_t **tp;
 
 		for (tp = &tl->tl_head[t]; *tp != NULL; tp = &(*tp)->tn_next[t])
@@ -669,7 +848,7 @@ txg_list_add_tail(txg_list_t *tl, void *p, uint64_t txg)
 	}
 	mutex_exit(&tl->tl_lock);
 
-	return (already_on_list);
+	return (add);
 }
 
 /*
@@ -720,13 +899,13 @@ txg_list_remove_this(txg_list_t *tl, void *p, uint64_t txg)
 	return (NULL);
 }
 
-int
+boolean_t
 txg_list_member(txg_list_t *tl, void *p, uint64_t txg)
 {
 	int t = txg & TXG_MASK;
 	txg_node_t *tn = (txg_node_t *)((char *)p + tl->tl_offset);
 
-	return (tn->tn_member[t]);
+	return (tn->tn_member[t] != 0);
 }
 
 /*
@@ -767,4 +946,7 @@ EXPORT_SYMBOL(txg_wait_open);
 EXPORT_SYMBOL(txg_wait_callbacks);
 EXPORT_SYMBOL(txg_stalled);
 EXPORT_SYMBOL(txg_sync_waiting);
+
+module_param(zfs_txg_timeout, int, 0644);
+MODULE_PARM_DESC(zfs_txg_timeout, "Max seconds worth of delta per txg");
 #endif

@@ -20,10 +20,12 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
  */
 
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
+#include <sys/spa_impl.h>
 #include <sys/vdev_file.h>
 #include <sys/vdev_impl.h>
 #include <sys/zio.h>
@@ -47,19 +49,23 @@ vdev_file_rele(vdev_t *vd)
 }
 
 static int
-vdev_file_open(vdev_t *vd, uint64_t *psize, uint64_t *ashift)
+vdev_file_open(vdev_t *vd, uint64_t *psize, uint64_t *max_psize,
+    uint64_t *ashift)
 {
 	vdev_file_t *vf;
 	vnode_t *vp;
 	vattr_t vattr;
 	int error;
 
+	/* Rotational optimizations only make sense on block devices */
+	vd->vdev_nonrot = B_TRUE;
+
 	/*
 	 * We must have a pathname, and it must be absolute.
 	 */
 	if (vd->vdev_path == NULL || vd->vdev_path[0] != '/') {
 		vd->vdev_stat.vs_aux = VDEV_AUX_BAD_LABEL;
-		return (EINVAL);
+		return (SET_ERROR(EINVAL));
 	}
 
 	/*
@@ -97,7 +103,7 @@ vdev_file_open(vdev_t *vd, uint64_t *psize, uint64_t *ashift)
 	 */
 	if (vp->v_type != VREG) {
 		vd->vdev_stat.vs_aux = VDEV_AUX_OPEN_FAILED;
-		return (ENODEV);
+		return (SET_ERROR(ENODEV));
 	}
 #endif
 
@@ -112,7 +118,7 @@ skip_open:
 		return (error);
 	}
 
-	*psize = vattr.va_size;
+	*max_psize = *psize = vattr.va_size;
 	*ashift = SPA_MINBLOCKSHIFT;
 
 	return (0);
@@ -137,31 +143,13 @@ vdev_file_close(vdev_t *vd)
 	vd->vdev_tsd = NULL;
 }
 
-static int
-vdev_file_io_start(zio_t *zio)
+static void
+vdev_file_io_strategy(void *arg)
 {
+	zio_t *zio = (zio_t *)arg;
 	vdev_t *vd = zio->io_vd;
 	vdev_file_t *vf = vd->vdev_tsd;
-	ssize_t resid = 0;
-
-	if (zio->io_type == ZIO_TYPE_IOCTL) {
-		/* XXPOLICY */
-		if (!vdev_readable(vd)) {
-			zio->io_error = ENXIO;
-			return (ZIO_PIPELINE_CONTINUE);
-		}
-
-		switch (zio->io_cmd) {
-		case DKIOCFLUSHWRITECACHE:
-			zio->io_error = VOP_FSYNC(vf->vf_vnode, FSYNC | FDSYNC,
-			    kcred, NULL);
-			break;
-		default:
-			zio->io_error = ENOTSUP;
-		}
-
-		return (ZIO_PIPELINE_CONTINUE);
-	}
+	ssize_t resid;
 
 	zio->io_error = vn_rdwr(zio->io_type == ZIO_TYPE_READ ?
 	    UIO_READ : UIO_WRITE, vf->vf_vnode, zio->io_data,
@@ -169,11 +157,70 @@ vdev_file_io_start(zio_t *zio)
 	    0, RLIM64_INFINITY, kcred, &resid);
 
 	if (resid != 0 && zio->io_error == 0)
-		zio->io_error = ENOSPC;
+		zio->io_error = SET_ERROR(ENOSPC);
+
+	zio_delay_interrupt(zio);
+}
+
+static void
+vdev_file_io_fsync(void *arg)
+{
+	zio_t *zio = (zio_t *)arg;
+	vdev_file_t *vf = zio->io_vd->vdev_tsd;
+
+	zio->io_error = VOP_FSYNC(vf->vf_vnode, FSYNC | FDSYNC, kcred, NULL);
 
 	zio_interrupt(zio);
+}
 
-	return (ZIO_PIPELINE_STOP);
+static void
+vdev_file_io_start(zio_t *zio)
+{
+	vdev_t *vd = zio->io_vd;
+	vdev_file_t *vf = vd->vdev_tsd;
+
+	if (zio->io_type == ZIO_TYPE_IOCTL) {
+		/* XXPOLICY */
+		if (!vdev_readable(vd)) {
+			zio->io_error = SET_ERROR(ENXIO);
+			zio_interrupt(zio);
+			return;
+		}
+
+		switch (zio->io_cmd) {
+		case DKIOCFLUSHWRITECACHE:
+
+			if (zfs_nocacheflush)
+				break;
+
+			/*
+			 * We cannot safely call vfs_fsync() when PF_FSTRANS
+			 * is set in the current context.  Filesystems like
+			 * XFS include sanity checks to verify it is not
+			 * already set, see xfs_vm_writepage().  Therefore
+			 * the sync must be dispatched to a different context.
+			 */
+			if (spl_fstrans_check()) {
+				VERIFY3U(taskq_dispatch(system_taskq,
+				    vdev_file_io_fsync, zio, TQ_SLEEP), !=, 0);
+				return;
+			}
+
+			zio->io_error = VOP_FSYNC(vf->vf_vnode, FSYNC | FDSYNC,
+			    kcred, NULL);
+			break;
+		default:
+			zio->io_error = SET_ERROR(ENOTSUP);
+		}
+
+		zio_execute(zio);
+		return;
+	}
+
+	zio->io_target_timestamp = zio_handle_io_delay(zio);
+
+	VERIFY3U(taskq_dispatch(system_taskq, vdev_file_io_strategy, zio,
+	    TQ_SLEEP), !=, 0);
 }
 
 /* ARGSUSED */

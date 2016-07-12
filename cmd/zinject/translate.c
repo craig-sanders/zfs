@@ -20,6 +20,7 @@
  */
 /*
  * Copyright (c) 2006, 2010, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012 by Delphix. All rights reserved.
  */
 
 #include <libzfs.h>
@@ -114,7 +115,11 @@ parse_pathname(const char *inpath, char *dataset, char *relpath,
 		return (-1);
 	}
 
+#ifdef HAVE_SETMNTENT
+	if ((fp = setmntent(MNTTAB, "r")) == NULL) {
+#else
 	if ((fp = fopen(MNTTAB, "r")) == NULL) {
+#endif
 		(void) fprintf(stderr, "cannot open /etc/mtab\n");
 		return (-1);
 	}
@@ -462,7 +467,7 @@ translate_device(const char *pool, const char *device, err_type_t label_type,
 	if ((zhp = zpool_open(g_zfs, pool)) == NULL)
 		return (-1);
 
-	record->zi_guid = strtoull(device, &end, 16);
+	record->zi_guid = strtoull(device, &end, 0);
 	if (record->zi_guid == 0 || *end != '\0') {
 		tgt = zpool_find_vdev(zhp, device, &isspare, &iscache, NULL);
 
@@ -474,6 +479,20 @@ translate_device(const char *pool, const char *device, err_type_t label_type,
 
 		verify(nvlist_lookup_uint64(tgt, ZPOOL_CONFIG_GUID,
 		    &record->zi_guid) == 0);
+	}
+
+	/*
+	 * Device faults can take on three different forms:
+	 * 1). delayed or hanging I/O
+	 * 2). zfs label faults
+	 * 3). generic disk faults
+	 */
+	if (record->zi_timer != 0) {
+		record->zi_cmd = ZINJECT_DELAY_IO;
+	} else if (label_type != TYPE_INVAL) {
+		record->zi_cmd = ZINJECT_LABEL_FAULT;
+	} else {
+		record->zi_cmd = ZINJECT_DEVICE_FAULT;
 	}
 
 	switch (label_type) {

@@ -27,9 +27,8 @@
 #include_next <sys/mount.h>
 
 #ifndef _LIBSPL_SYS_MOUNT_H
-#define _LIBSPL_SYS_MOUNT_H
+#define	_LIBSPL_SYS_MOUNT_H
 
-#include <sys/mntent.h>
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,7 +38,7 @@
  * and we don't want to require the kernel headers
  */
 #if !defined(BLKGETSIZE64)
-#define BLKGETSIZE64		_IOR(0x12, 114, size_t)
+#define	BLKGETSIZE64		_IOR(0x12, 114, size_t)
 #endif
 
 /*
@@ -48,13 +47,22 @@
  * headers define MS_DIRSYNC to be S_WRITE.
  */
 #if !defined(MS_DIRSYNC)
-#define MS_DIRSYNC		S_WRITE
+#define	MS_DIRSYNC		S_WRITE
 #endif
 
-#define	MS_USERS	0x40000000
-#define	MS_OWNER	0x10000000
-#define	MS_GROUP	0x08000000
-#define	MS_COMMENT	0x02000000
+/*
+ * Some old glibc headers don't correctly define MS_POSIXACL and
+ * instead leave it undefined.  When using these older headers define
+ * MS_POSIXACL to the reserved value of (1<<16).
+ */
+#if !defined(MS_POSIXACL)
+#define	MS_POSIXACL		(1<<16)
+#endif
+
+#define	MS_USERS	(MS_NOEXEC|MS_NOSUID|MS_NODEV)
+#define	MS_OWNER	(MS_NOSUID|MS_NODEV)
+#define	MS_GROUP	(MS_NOSUID|MS_NODEV)
+#define	MS_COMMENT	0
 
 /*
  * Older glibc <sys/mount.h> headers did not define all the available
@@ -62,15 +70,15 @@
  * kernel back to 2.4.11 so we define them correctly if they are missing.
  */
 #ifdef MNT_FORCE
-# define MS_FORCE	MNT_FORCE
+#define	MS_FORCE	MNT_FORCE
 #else
-# define MS_FORCE	0x00000001
+#define	MS_FORCE	0x00000001
 #endif /* MNT_FORCE */
 
 #ifdef MNT_DETACH
-# define MS_DETACH	MNT_DETACH
+#define	MS_DETACH	MNT_DETACH
 #else
-# define MS_DETACH	0x00000002
+#define	MS_DETACH	0x00000002
 #endif /* MNT_DETACH */
 
 /*
@@ -78,6 +86,6 @@
  * compatibility, MS_OVERLAY is defined to explicitly have the user
  * provide a flag (-O) to mount over a non empty directory.
  */
-#define MS_OVERLAY      0x00000004
+#define	MS_OVERLAY	0x00000004
 
 #endif /* _LIBSPL_SYS_MOUNT_H */

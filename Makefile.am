@@ -1,23 +1,27 @@
-include $(top_srcdir)/config/rpm.am
-include $(top_srcdir)/config/deb.am
-include $(top_srcdir)/config/tgz.am
-include $(top_srcdir)/config/arch.am
+ACLOCAL_AMFLAGS = -I config
 
+include config/rpm.am
+include config/deb.am
+include config/tgz.am
+
+SUBDIRS = include rpm
 if CONFIG_USER
-USER_DIR = dracut udev etc man scripts lib cmd
+SUBDIRS += udev etc man scripts tests lib cmd contrib
 endif
 if CONFIG_KERNEL
-KERNEL_DIR = module
+SUBDIRS += module
+
+extradir = @prefix@/src/zfs-$(VERSION)
+extra_HEADERS = zfs.release.in zfs_config.h.in
+
+kerneldir = @prefix@/src/zfs-$(VERSION)/$(LINUX_VERSION)
+nodist_kernel_HEADERS = zfs.release zfs_config.h module/$(LINUX_SYMBOLS)
 endif
-SUBDIRS = $(USER_DIR) $(KERNEL_DIR) include
 
 AUTOMAKE_OPTIONS = foreign
-EXTRA_DIST  = autogen.sh zfs.spec.in zfs-modules.spec.in
+EXTRA_DIST  = autogen.sh copy-builtin
 EXTRA_DIST += config/config.awk config/rpm.am config/deb.am config/tgz.am
-EXTRA_DIST += META DISCLAIMER COPYRIGHT README.markdown
-EXTRA_DIST += OPENSOLARIS.LICENSE ZFS.RELEASE
-
-noinst_HEADERS = zfs_config.h
+EXTRA_DIST += META DISCLAIMER COPYRIGHT README.markdown OPENSOLARIS.LICENSE
 
 distclean-local::
 	-$(RM) -R autom4te*.cache
@@ -31,26 +35,36 @@ distclean-local::
 		-o -name '*.order' -o -name '*.markers' \) \
 		-type f -print | xargs $(RM)
 
-if CONFIG_KERNEL
-install-data-local:
-	release=$(ZFS_META_VERSION)-$(ZFS_META_RELEASE); \
-	instdest=$(DESTDIR)/usr/src/zfs-$$release/$(LINUX_VERSION); \
-	echo "$$release" >$$instdest/zfs.release; \
-	for instfile in $(noinst_HEADERS) module/$(LINUX_SYMBOLS); do \
-		$(INSTALL) -D $$instfile $$instdest/$$instfile; \
-	done
-endif
+dist-hook:
+	sed -i 's/Release:[[:print:]]*/Release:      $(RELEASE)/' \
+		$(distdir)/META
+
+checkstyle: cstyle shellcheck
+
+cstyle:
+	@find ${top_srcdir} -name '*.[hc]' ! -name 'zfs_config.*' \
+		! -name '*.mod.c' -type f -exec scripts/cstyle.pl {} \+
+
+shellcheck:
+	@if type shellcheck > /dev/null 2>&1; then \
+		(find ${top_srcdir} -type f -name '*.sh.in' -o -type f \
+		 -name '*.sh'; find etc/init.d/zfs*.in -type f) | \
+		 grep -v 'zfs-script-config' | \
+		 while read file; do \
+			shellcheck --format gcc "$$file"; \
+		 done; \
+	 fi
 
 ctags:
-	$(RM) $(top_srcdir)/tags
+	$(RM) tags
 	find $(top_srcdir) -name .git -prune -o -name '*.[hc]' | xargs ctags
 
 etags:
-	$(RM) $(top_srcdir)/TAGS
+	$(RM) TAGS
 	find $(top_srcdir) -name .pc -prune -o -name '*.[hc]' | xargs etags -a
 
 tags: ctags etags
 
 pkg: @DEFAULT_PACKAGE@
-pkg-modules: @DEFAULT_PACKAGE@-modules
+pkg-kmod: @DEFAULT_PACKAGE@-kmod
 pkg-utils: @DEFAULT_PACKAGE@-utils
